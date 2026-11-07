@@ -1,5 +1,6 @@
 package com.lordhck.btcwallet
 
+import android.content.pm.ApplicationInfo
 import android.graphics.Color
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -15,7 +16,10 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
         )
         super.onCreate(savedInstanceState)
-        val start = intent.getStringExtra("screen")
+        Debug.start(this)
+        val debug = applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+        // debug builds only: in a release this would skip the PIN
+        val start = if (debug) intent.getStringExtra("screen") else null
         setContent { App(start) }
     }
 }

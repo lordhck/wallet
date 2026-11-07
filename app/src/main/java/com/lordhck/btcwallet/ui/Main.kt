@@ -1,12 +1,19 @@
 package com.lordhck.btcwallet.ui
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.AnimatedVisibility
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
 import androidx.compose.animation.core.*
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -26,8 +33,6 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.RoundRect
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -40,7 +45,12 @@ import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -49,58 +59,72 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.delay
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.PlanarYUVLuminanceSource
+import com.google.zxing.ReaderException
+import com.google.zxing.common.HybridBinarizer
+import com.google.zxing.qrcode.QRCodeReader
+import com.lordhck.btcwallet.Debug
+import com.lordhck.btcwallet.Draft
+import com.lordhck.btcwallet.Money
+import com.lordhck.btcwallet.Net
+import com.lordhck.btcwallet.Payment
+import com.lordhck.btcwallet.Receiving
 import kotlinx.coroutines.launch
+import org.bitcoindevkit.AddressParseException
+import org.bitcoindevkit.CreateTxException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
 // ---------- home ----------
 @Composable
-private fun Spinner() {
-    val spin = rememberInfiniteTransition(label = "spin")
-    val turn by spin.animateFloat(
-        0f,
-        360f,
-        infiniteRepeatable(tween(900, easing = LinearEasing)),
-        label = "spin",
-    )
-    Canvas(Modifier.requiredSize(46.dp)) {
-        val w = 2.dp.toPx()
-        drawArc(
-            C.accent,
-            turn - 135f,
-            90f,
-            false,
-            Offset(w / 2, w / 2),
-            Size(size.width - w, size.height - w),
-            style = Stroke(w),
-        )
-    }
-}
-
-@Composable
-private fun TxRow(tx: Tx, divider: Boolean) {
+private fun PaymentRow(payment: Payment, amount: String, price: Double?, divider: Boolean, onClick: () -> Unit) {
+    val pending = payment.time == null
+    val sub = payment.time?.let {
+        "Confirmed · " + SimpleDateFormat("d MMM", Locale.getDefault()).format(Date(it * 1000))
+    } ?: if (payment.incoming) "Unconfirmed" else "Broadcast"
     if (divider) Spacer(Modifier.fillMaxWidth().height(1.dp).background(C.line))
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 12.dp),
+        Modifier.fillMaxWidth().press(onClick = onClick).padding(horizontal = 4.dp, vertical = 12.dp),
         Arrangement.spacedBy(14.dp),
         Alignment.CenterVertically,
     ) {
         Box(
             Modifier
                 .size(40.dp)
-                .background(if (tx.incoming) C.green.copy(alpha = .12f) else C.surface2, CircleShape),
+                .background(if (payment.incoming) C.green.copy(alpha = .12f) else C.surface2, CircleShape),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(if (tx.incoming) Ic.txIn else Ic.txOut, 18.dp, if (tx.incoming) C.green else C.soft)
-            if (tx.pending) Spinner()
+            Icon(if (payment.incoming) Ic.txIn else Ic.txOut, 18.dp, if (payment.incoming) C.green else C.soft)
         }
         Column(Modifier.weight(1f)) {
-            Txt(tx.title, weight = 600)
-            Txt(tx.sub, Modifier.padding(top = 2.dp), if (tx.pending) C.accent else C.muted, 13f)
+            Txt(
+                when {
+                    payment.self -> "Sent to yourself"
+                    payment.incoming -> "Received"
+                    else -> "Sent"
+                },
+                weight = 600,
+            )
+            Txt(sub, Modifier.padding(top = 2.dp), if (pending) C.accent else C.muted, 13f)
         }
         Column(horizontalAlignment = Alignment.End) {
-            Txt(tx.amount, color = if (tx.incoming) C.green else C.text, weight = 600, tabular = true)
-            Txt(tx.fiat, Modifier.padding(top = 2.dp), C.muted, 13f)
+            Txt(
+                (if (payment.incoming) "+" else "−") + amount,
+                color = if (payment.incoming) C.green else C.text,
+                weight = 600,
+                tabular = true,
+            )
+            if (payment.self) {
+                Txt("Network fee", Modifier.padding(top = 2.dp), C.muted, 13f)
+            } else if (price != null) {
+                Txt(Money.usd(payment.sats, price), Modifier.padding(top = 2.dp), C.muted, 13f)
+            }
         }
     }
 }
@@ -115,7 +139,7 @@ private fun Action(label: String, bg: Color, icon: Int, onClick: () -> Unit) {
         icon,
         0.dp,
         PaddingValues(horizontal = 28.dp, vertical = 15.dp),
-        onClick,
+        onClick = onClick,
     )
 }
 
@@ -124,7 +148,7 @@ private fun BoxScope.TestBadge(label: String) {
     Row(
         Modifier
             .align(Alignment.TopStart)
-            .padding(start = 20.dp, top = 20.dp)
+            .padding(start = 20.dp, top = 32.dp)
             .height(28.dp)
             .background(C.surface, CircleShape)
             .padding(start = 7.dp, end = 11.dp),
@@ -141,35 +165,50 @@ private fun BoxScope.TestBadge(label: String) {
 @Composable
 private fun HomeContent() {
     val nav = LocalNav.current
-    var bal by rememberSaveable { mutableIntStateOf(0) }
+    val wallet = nav.wallet
+    val net = wallet.net
+    val uris = LocalUriHandler.current
+    // test coins have no dollar value
+    val price = if (net == Net.Main) wallet.price else null
+    // starts over when a setting or the first price changes the list
+    var view by rememberSaveable(wallet.currency, wallet.unit, price != null) { mutableIntStateOf(0) }
+    // what Settings picked comes first, tapping moves through the rest
+    val views = buildList {
+        val coin = Money.btc(wallet.sats) + " " + net.coin
+        val sats = Money.sats(wallet.sats)
+        // zero is zero in any currency, so this needs no price
+        val usd = price?.let { Money.usd(wallet.sats, it) } ?: if (net == Net.Main && wallet.sats == 0L) "$0.00" else null
+        if (usd != null && wallet.currency == "USD") add(usd)
+        addAll(if (wallet.unit == "sats") listOf(sats, coin) else listOf(coin, sats))
+        if (usd != null && wallet.currency != "USD") add(usd)
+    }
+    val balance = if (nav.balanceHidden) "••••••" else views[view % views.size]
+
     Box(Modifier.fillMaxSize().background(C.bg).statusBarsPadding()) {
         Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+            // scales with the phone, a fixed offset leaves tall screens top heavy
+            Spacer(Modifier.fillMaxHeight(.16f))
             Txt(
-                BALANCES[bal],
-                Modifier
-                    .padding(top = 100.dp, bottom = 12.dp)
-                    .press { bal = (bal + 1) % BALANCES.size },
-                size = 46f,
+                balance,
+                Modifier.press {
+                    if (nav.balanceHidden) nav.balanceHidden = false else view = (view + 1) % views.size
+                },
+                size = if (balance.length > 11) 32f else 46f,
                 weight = 700,
                 tabular = true,
             )
-            Row(
-                Modifier.padding(bottom = 32.dp),
-                Arrangement.spacedBy(6.dp),
-                Alignment.CenterVertically,
-            ) {
-                Txt("+$23.18", color = C.green, weight = 600)
-                Row(
-                    Modifier
-                        .background(C.green.copy(alpha = .15f), RoundedCornerShape(6.dp))
-                        .padding(horizontal = 7.dp, vertical = 3.dp),
-                    Arrangement.spacedBy(5.dp),
-                    Alignment.CenterVertically,
-                ) {
-                    Txt("1.84%", color = C.green, size = 13.5f, weight = 600)
-                    Icon(Ic.trendUp, 14.dp, C.green)
-                }
-            }
+            Txt(
+                when {
+                    wallet.error != null -> "Wallet error: " + wallet.error
+                    wallet.offline != null -> "Can't reach the server: " + wallet.offline
+                    !wallet.synced -> "Syncing…"
+                    else -> ""
+                },
+                Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 24.dp).heightIn(min = 18.dp),
+                if (wallet.error != null) C.red else C.muted,
+                13f,
+                align = TextAlign.Center,
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(28.dp)) {
                 Action("Send", C.btc, Ic.send) { nav.show(S.Send) }
                 Action("Receive", C.light, Ic.receive) { nav.show(S.Receive) }
@@ -184,18 +223,25 @@ private fun HomeContent() {
                     .padding(start = 16.dp, end = 16.dp, bottom = 24.dp),
             ) {
                 Gt("Activity", first = true)
-                TXS.forEachIndexed { i, tx -> TxRow(tx, i > 0) }
+                if (wallet.payments.isEmpty()) {
+                    Txt("No transactions yet", Modifier.padding(start = 4.dp, top = 4.dp), C.muted, 14f)
+                }
+                wallet.payments.forEachIndexed { i, payment ->
+                    PaymentRow(payment, wallet.amount(payment.sats), price, i > 0) {
+                        uris.openUri(net.explorer + payment.id)
+                    }
+                }
             }
         }
         Box(
             Modifier
                 .align(Alignment.TopEnd)
-                .padding(top = 12.dp, end = 18.dp)
+                .padding(top = 24.dp, end = 18.dp)
                 .clip(RoundedCornerShape(10.dp))
                 .press { nav.show(S.Settings) }
                 .padding(8.dp),
         ) { Icon(Ic.gear, 24.dp, C.soft) }
-        nav.test?.let { TestBadge(it) }
+        if (net != Net.Main) TestBadge(net.label)
     }
 }
 
@@ -203,12 +249,7 @@ private fun HomeContent() {
 fun Home() = HomeContent()
 
 // ---------- send ----------
-private val UNITS = listOf("USD", "BTC", "sats")
-private val FEES = listOf(
-    "Slow" to "~1 hour · 2 sat/vB",
-    "Medium" to "~30 min · 6 sat/vB",
-    "Fast" to "~10 min · 12 sat/vB",
-)
+private val FEES = listOf("Slow" to "~1 hour", "Medium" to "~30 min", "Fast" to "~10 min")
 
 @Composable
 private fun FeePicker(fee: Int, onPick: (Int) -> Unit) {
@@ -244,16 +285,22 @@ private fun Kv(key: String, value: String, mono: Boolean = false) {
     Spacer(Modifier.fillMaxWidth().height(1.dp).background(C.surface3))
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 13.dp),
-        Arrangement.SpaceBetween,
+        Arrangement.spacedBy(16.dp),
     ) {
         Txt(key, size = 14.5f)
-        Txt(value, color = C.soft, size = if (mono) 13.5f else 14.5f, mono = mono)
+        Txt(
+            value,
+            Modifier.weight(1f),
+            C.soft,
+            if (mono) 13.5f else 14.5f,
+            mono = mono,
+            align = TextAlign.End,
+        )
     }
 }
 
 @Composable
-private fun SlideToSend(onSent: () -> Unit) {
-    val scope = rememberCoroutineScope()
+private fun SlideToSend(onSlid: () -> Unit) {
     val density = LocalDensity.current
     val inset = with(density) { 4.dp.toPx() }
     val near = with(density) { 6.dp.toPx() }
@@ -263,6 +310,7 @@ private fun SlideToSend(onSent: () -> Unit) {
     var width by remember { mutableIntStateOf(0) }
     var x by remember { mutableFloatStateOf(0f) }
     var dragging by remember { mutableStateOf(false) }
+    var sent by remember { mutableStateOf(false) }
     val left by animateFloatAsState(
         x,
         if (dragging) snap() else tween(200),
@@ -279,7 +327,7 @@ private fun SlideToSend(onSent: () -> Unit) {
             .onSizeChanged { width = it.width },
         contentAlignment = Alignment.Center,
     ) {
-        Txt(label, Modifier.padding(start = 40.dp), C.dim, weight = 600)
+        Txt(label, color = C.dim, weight = 600)
         Box(
             Modifier
                 .align(Alignment.CenterStart)
@@ -291,23 +339,21 @@ private fun SlideToSend(onSent: () -> Unit) {
                         onDragStart = { dragging = true },
                         onDragEnd = {
                             dragging = false
-                            if (x >= travel - near) {
+                            if (x >= travel - near && !sent) {
+                                sent = true
                                 label = "Sending…"
-                                scope.launch {
-                                    delay(700)
-                                    onSent()
-                                }
-                            } else {
+                                onSlid()
+                            } else if (!sent) {
                                 x = 0f
                             }
                         },
                         onDragCancel = {
                             dragging = false
-                            x = 0f
+                            if (!sent) x = 0f
                         },
                     ) { change, delta ->
                         change.consume()
-                        x = (x + delta).coerceIn(0f, travel)
+                        if (!sent) x = (x + delta).coerceIn(0f, travel)
                     }
                 },
             contentAlignment = Alignment.Center,
@@ -316,74 +362,104 @@ private fun SlideToSend(onSent: () -> Unit) {
 }
 
 @Composable
-private fun BoxScope.ConfirmSheet(open: Boolean, onClose: () -> Unit, onSent: () -> Unit) {
-    AnimatedVisibility(open, enter = fadeIn(tween(200)), exit = fadeOut(tween(200))) {
-        Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .6f)).press(onClick = onClose))
-    }
-    AnimatedVisibility(
-        open,
-        Modifier.align(Alignment.BottomCenter),
-        enter = slideInVertically(tween(250)) { it },
-        exit = slideOutVertically(tween(250)) { it },
+private fun BoxScope.ConfirmSheet(
+    draft: Draft,
+    amount: (Long) -> String,
+    price: Double?,
+    sending: Boolean,
+    onClose: () -> Unit,
+    onSlid: () -> Unit,
+) {
+    Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .6f)).press { if (!sending) onClose() })
+    Column(
+        Modifier
+            .align(Alignment.BottomCenter)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+            .background(C.surface)
+            .press { }
+            .navigationBarsPadding()
+            .padding(start = 16.dp, end = 16.dp, top = 24.dp, bottom = 28.dp),
     ) {
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
-                .background(C.surface)
-                .press { }
-                .navigationBarsPadding()
-                .padding(start = 16.dp, end = 16.dp, top = 24.dp, bottom = 28.dp),
-        ) {
-            Txt(
-                "0.00100000 BTC",
-                Modifier.fillMaxWidth(),
-                size = 30f,
-                weight = 700,
-                align = TextAlign.Center,
-                tabular = true,
-            )
-            Txt(
-                "≈ $102.76",
-                Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 20.dp),
-                C.dim,
-                14.5f,
-                align = TextAlign.Center,
-            )
-            Kv("To", "bc1qxy2k…hx0wlh", mono = true)
-            Kv("Network fee", "846 sats · $0.87")
-            Kv("Total", "0.00100846 BTC")
-            SlideToSend(onSent)
-            Ghost("Cancel", onClose)
-        }
+        Txt(
+            amount(draft.sats),
+            Modifier.fillMaxWidth(),
+            size = 30f,
+            weight = 700,
+            align = TextAlign.Center,
+            tabular = true,
+        )
+        Txt(
+            if (price != null) "≈ " + Money.usd(draft.sats, price) else "",
+            Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 20.dp),
+            C.dim,
+            14.5f,
+            align = TextAlign.Center,
+        )
+        Kv("To", draft.to, mono = true)
+        Kv("Network fee", Money.sats(draft.fee))
+        Kv("Total", amount(draft.sats + draft.fee))
+        SlideToSend(onSlid)
+        if (!sending) Ghost("Cancel", onClose)
     }
 }
 
 @Composable
 fun Send() {
     val nav = LocalNav.current
-    var addr by rememberSaveable { mutableStateOf("") }
-    var amount by rememberSaveable { mutableStateOf("0.001") }
-    var unit by rememberSaveable { mutableIntStateOf(1) }
-    var fee by rememberSaveable { mutableIntStateOf(1) }
-    var sheet by rememberSaveable { mutableStateOf(false) }
+    val wallet = nav.wallet
+    val net = wallet.net
+    val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
+    val price = if (net == Net.Main) wallet.price else null
+    val units = if (net == Net.Main) listOf("USD", "BTC", "sats") else listOf(net.coin, "sats")
+    val coinUnit = if (net == Net.Main) 1 else 0
 
-    BackHandler(sheet) { sheet = false }
+    var addr by rememberSaveable { mutableStateOf("") }
+    var amount by rememberSaveable { mutableStateOf("") }
+    var unit by rememberSaveable { mutableIntStateOf(if (wallet.unit == "sats") units.lastIndex else coinUnit) }
+    var fee by rememberSaveable { mutableIntStateOf(1) }
+    var all by rememberSaveable { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var sending by remember { mutableStateOf(false) }
+    var draft by remember { mutableStateOf<Draft?>(null) }
+
+    LaunchedEffect(Unit) {
+        nav.scanned?.let { code ->
+            nav.scanned = null
+            addr = code.removePrefix("bitcoin:").removePrefix("BITCOIN:").substringBefore('?')
+            Regex("[?&]amount=([0-9.]+)", RegexOption.IGNORE_CASE).find(code)?.let {
+                amount = it.groupValues[1]
+                unit = coinUnit
+                all = false
+            }
+        }
+        wallet.loadFees(force = true)
+    }
+
+    val sats = Money.parse(amount, units[unit % units.size], price)
+    val rate = wallet.rates?.get(fee)
+    val ready = addr.isNotBlank() && (all || sats != null) && rate != null && !busy
+
+    BackHandler(draft != null && !sending) { draft = null }
     Box(Modifier.fillMaxSize()) {
         Scr {
             Bar("Send")
             Body {
                 InputRow {
                     Input(addr, { addr = it }, "Bitcoin address", Modifier.weight(1f), mono = true, bare = true)
-                    IconBtn(Ic.paste) { nav.toast("Pasted") }
+                    IconBtn(Ic.paste) { clipboard.getText()?.let { addr = it.text.trim() } }
                     IconBtn(Ic.scan, C.accent) { nav.show(S.Scanner) }
                 }
-                Msg("")
                 Gt("Amount")
                 InputRow {
                     Input(
                         amount,
-                        { amount = it },
+                        {
+                            amount = it
+                            all = false
+                        },
                         "0",
                         Modifier.weight(1f),
                         big = true,
@@ -394,12 +470,15 @@ fun Send() {
                         Modifier
                             .clip(RoundedCornerShape(10.dp))
                             .background(C.surface3)
-                            .press { unit = (unit + 1) % UNITS.size }
+                            .press {
+                                unit = (unit + 1) % units.size
+                                all = false
+                            }
                             .padding(horizontal = 11.dp, vertical = 7.dp),
                         Arrangement.spacedBy(5.dp),
                         Alignment.CenterVertically,
                     ) {
-                        Txt(UNITS[unit], size = 13.5f, weight = 600)
+                        Txt(units[unit % units.size], size = 13.5f, weight = 600)
                         Icon(Ic.updown, 14.dp, C.dim)
                     }
                 }
@@ -407,32 +486,86 @@ fun Send() {
                     Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 8.dp),
                     Arrangement.SpaceBetween,
                 ) {
-                    Txt("≈ $102.76", color = C.muted, size = 13f)
+                    Txt(
+                        if (sats != null && price != null) "≈ " + Money.usd(sats, price) else "",
+                        color = C.muted,
+                        size = 13f,
+                    )
                     BasicText(
                         buildAnnotatedString {
-                            append("Available 0.01250000 BTC · ")
+                            append("Available " + wallet.amount(wallet.sats) + " · ")
                             withStyle(SpanStyle(color = C.accent, fontWeight = FontWeight.SemiBold)) {
                                 append("Max")
                             }
                         },
-                        style = style(C.muted, 13f),
+                        Modifier.press {
+                            amount = Money.btc(wallet.sats)
+                            unit = coinUnit
+                            all = true
+                        },
+                        style(C.muted, 13f),
                     )
                 }
                 Gt("Network fee")
                 FeePicker(fee) { fee = it }
-                Msg(FEES[fee].second)
-                Primary("Review") { sheet = true }
+                Msg(
+                    error ?: rate?.let { if (net == Net.Main) FEES[fee].second + " · $it sat/vB" else "$it sat/vB" }
+                        ?: "Getting fees…",
+                    error != null,
+                )
+                Primary(if (busy) "Checking…" else "Review", ready) {
+                    busy = true
+                    error = null
+                    scope.launch {
+                        try {
+                            val feeRate = checkNotNull(rate)
+                            draft = wallet.use { it.draft(addr.trim(), if (all) null else sats, feeRate) }
+                        } catch (e: AddressParseException) {
+                            Debug.note("review failed: " + Debug.why(e))
+                            error = "That isn't a valid ${net.label} address"
+                        } catch (e: CreateTxException.InsufficientFunds) {
+                            Debug.note("review failed: " + Debug.why(e))
+                            error = "Not enough funds, including the network fee"
+                        } catch (e: CreateTxException.CoinSelection) {
+                            Debug.note("review failed: " + Debug.why(e))
+                            error = "Not enough for this amount plus the network fee. Try a lower fee or Max"
+                        } catch (e: CreateTxException.OutputBelowDustLimit) {
+                            Debug.note("review failed: " + Debug.why(e))
+                            error = "That amount is too small to send"
+                        } catch (e: Exception) {
+                            Debug.note("review failed: " + Debug.why(e))
+                            error = "Couldn't create the transaction"
+                        }
+                        busy = false
+                    }
+                }
             }
         }
-        ConfirmSheet(
-            sheet,
-            onClose = { sheet = false },
-            onSent = {
-                sheet = false
-                nav.root(S.Home)
-                nav.toast("Transaction broadcast")
-            },
-        )
+        draft?.let { ready ->
+            ConfirmSheet(
+                ready,
+                wallet::amount,
+                price,
+                sending,
+                onClose = { draft = null },
+                onSlid = {
+                    sending = true
+                    wallet.send(ready) { ok ->
+                        sending = false
+                        draft = null
+                        if (ok) {
+                            addr = ""
+                            amount = ""
+                            all = false
+                            nav.root(S.Home)
+                            nav.toast("Transaction broadcast")
+                        } else {
+                            nav.toast("Sending failed. Check Activity first")
+                        }
+                    }
+                },
+            )
+        }
     }
 }
 
@@ -440,43 +573,74 @@ fun Send() {
 @Composable
 fun Receive() {
     val nav = LocalNav.current
-    var a by rememberSaveable { mutableIntStateOf(0) }
+    val wallet = nav.wallet
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val scope = rememberCoroutineScope()
+    var receiving by remember { mutableStateOf<Receiving?>(null) }
+    var failed by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(wallet.net) {
+        try {
+            receiving = wallet.use { it.address() }
+        } catch (e: Exception) {
+            Debug.note("address failed: " + Debug.why(e))
+            failed = e.message ?: e.javaClass.simpleName
+        }
+    }
+
+    val current = receiving
     Scr {
         Bar("Receive")
         Body(scroll = false) {
             Spacer(Modifier.weight(1f))
-            Column(
-                Modifier.fillMaxWidth(),
-                Arrangement.spacedBy(22.dp),
-                Alignment.CenterHorizontally,
-            ) {
-                Tag("Native SegWit")
-                Box(Modifier.background(Color.White, RoundedCornerShape(22.dp)).padding(16.dp)) {
-                    Qr(QR_RECEIVE, 248.dp)
-                }
-                val parts = ADDRS[a].chunked(4)
-                BasicText(
-                    buildAnnotatedString {
-                        parts.forEachIndexed { i, p ->
-                            if (i > 0) append(' ')
-                            if (i == 0 || i == parts.lastIndex) {
-                                withStyle(SpanStyle(color = C.text, fontWeight = FontWeight.SemiBold)) { append(p) }
-                            } else {
-                                append(p)
-                            }
-                        }
-                    },
-                    Modifier.widthIn(max = 300.dp),
-                    style(C.soft, 15f, mono = true, align = TextAlign.Center, line = 1.6f, spacing = .02f),
+            if (current == null) {
+                Txt(
+                    failed?.let { "Couldn't get an address: $it" } ?: "Getting an address…",
+                    Modifier.fillMaxWidth(),
+                    if (failed != null) C.red else C.muted,
+                    15f,
+                    align = TextAlign.Center,
                 )
+            } else {
+                Column(
+                    Modifier.fillMaxWidth(),
+                    Arrangement.spacedBy(22.dp),
+                    Alignment.CenterHorizontally,
+                ) {
+                    Box(Modifier.background(Color.White, RoundedCornerShape(22.dp)).padding(16.dp)) {
+                        Qr(current.uri, 248.dp)
+                    }
+                    val parts = current.address.chunked(4)
+                    BasicText(
+                        buildAnnotatedString {
+                            parts.forEachIndexed { i, p ->
+                                if (i > 0) append(' ')
+                                if (i == 0 || i == parts.lastIndex) {
+                                    withStyle(SpanStyle(color = C.text, fontWeight = FontWeight.SemiBold)) { append(p) }
+                                } else {
+                                    append(p)
+                                }
+                            }
+                        },
+                        Modifier.widthIn(max = 300.dp),
+                        style(C.soft, 15f, mono = true, align = TextAlign.Center, line = 1.6f, spacing = .02f),
+                    )
+                }
             }
             Spacer(Modifier.weight(1f))
             Row(Modifier.fillMaxWidth(), Arrangement.spacedBy(12.dp)) {
-                Btn("Copy", Modifier.weight(1f), C.light, Color.Black, Ic.copy, 0.dp) {
-                    nav.toast("Address copied")
+                Btn("Copy", Modifier.weight(1f), C.light, Color.Black, Ic.copy, 0.dp, enabled = current != null) {
+                    current?.let {
+                        clipboard.setText(AnnotatedString(it.address))
+                        nav.toast("Address copied")
+                    }
                 }
-                Btn("Share", Modifier.weight(1f), C.surface, C.text, Ic.share, 0.dp) {
-                    nav.toast("Share sheet opens")
+                Btn("Share", Modifier.weight(1f), C.surface, C.text, Ic.share, 0.dp, enabled = current != null) {
+                    current?.let {
+                        val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, it.address)
+                        context.startActivity(Intent.createChooser(send, null))
+                    }
                 }
             }
             Row(
@@ -484,8 +648,10 @@ fun Receive() {
                     .fillMaxWidth()
                     .padding(top = 18.dp)
                     .press {
-                        a = (a + 1) % ADDRS.size
-                        nav.toast("New address")
+                        scope.launch {
+                            receiving = runCatching { wallet.use { it.newAddress() } }.getOrNull() ?: receiving
+                            nav.toast("New address")
+                        }
                     }
                     .padding(6.dp),
                 Arrangement.spacedBy(7.dp, Alignment.CenterHorizontally),
@@ -510,7 +676,7 @@ private fun BoxScope.Round(
         Modifier
             .align(align)
             .statusBarsPadding()
-            .padding(start = 16.dp, end = 16.dp, top = 20.dp)
+            .padding(start = 16.dp, end = 16.dp, top = 32.dp)
             .clip(CircleShape)
             .background(if (on) C.accent else Color.Black.copy(alpha = .45f))
             .press(onClick = onClick)
@@ -518,12 +684,103 @@ private fun BoxScope.Round(
     ) { Icon(v, color = if (on) Color.Black else C.text) }
 }
 
-// A stand-in for the camera, as in wallet.html
+private fun decode(reader: QRCodeReader, image: ImageProxy): String? {
+    val plane = image.planes[0]
+    val bytes = ByteArray(plane.buffer.remaining()).also { plane.buffer.get(it) }
+    val source = PlanarYUVLuminanceSource(
+        bytes,
+        plane.rowStride,
+        image.height,
+        0,
+        0,
+        image.width,
+        image.height,
+        false,
+    )
+    return try {
+        reader.decode(BinaryBitmap(HybridBinarizer(source))).text
+    } catch (e: ReaderException) {
+        null
+    } finally {
+        reader.reset()
+    }
+}
+
+@Composable
+private fun CameraPreview(torch: Boolean, onCode: (String) -> Unit) {
+    val owner = LocalLifecycleOwner.current
+    val executor = remember { Executors.newSingleThreadExecutor() }
+    val reader = remember { QRCodeReader() }
+    var camera by remember { mutableStateOf<Camera?>(null) }
+    var provider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+
+    LaunchedEffect(camera, torch) { camera?.cameraControl?.enableTorch(torch) }
+    DisposableEffect(Unit) {
+        onDispose {
+            provider?.unbindAll()
+            executor.shutdown()
+        }
+    }
+
+    AndroidView(
+        factory = { context ->
+            PreviewView(context).also { view ->
+                val future = ProcessCameraProvider.getInstance(context)
+                future.addListener(
+                    {
+                        val cameras = future.get()
+                        val preview = Preview.Builder().build()
+                        preview.setSurfaceProvider(view.surfaceProvider)
+                        val analysis = ImageAnalysis.Builder()
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .build()
+                        analysis.setAnalyzer(executor) { image ->
+                            val code = decode(reader, image)
+                            image.close()
+                            if (code != null) view.post { onCode(code) }
+                        }
+                        cameras.unbindAll()
+                        provider = cameras
+                        camera = cameras.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+                    },
+                    ContextCompat.getMainExecutor(context),
+                )
+            }
+        },
+        modifier = Modifier.fillMaxSize(),
+    )
+}
+
 @Composable
 fun Scanner(hint: String) {
     val nav = LocalNav.current
+    val context = LocalContext.current
     var torch by rememberSaveable { mutableStateOf(false) }
+    var done by remember { mutableStateOf(false) }
+    var allowed by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED,
+        )
+    }
+    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        Debug.note("camera permission: $it")
+        allowed = it
+    }
+    LaunchedEffect(Unit) {
+        if (!allowed) ask.launch(Manifest.permission.CAMERA)
+    }
+
     BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
+        if (allowed) {
+            CameraPreview(torch) { code ->
+                if (!done) {
+                    done = true
+                    Debug.note("scanned a code, ${code.length} characters")
+                    nav.scanned = code
+                    nav.back()
+                }
+            }
+        }
         Canvas(Modifier.fillMaxSize()) {
             val side = 260.dp.toPx()
             val left = (size.width - side) / 2
@@ -533,14 +790,6 @@ fun Scanner(hint: String) {
             val arm = 34.dp.toPx()
             val mid = edge / 2
 
-            drawRect(
-                Brush.radialGradient(
-                    0f to Color(0xFF3A3A3A),
-                    .7f to Color(0xFF121212),
-                    center = Offset(size.width * .5f, size.height * .4f),
-                    radius = size.height * .85f,
-                ),
-            )
             val hole = Path().apply {
                 addRoundRect(RoundRect(left, top, left + side, top + side, CornerRadius(radius)))
             }
@@ -566,7 +815,7 @@ fun Scanner(hint: String) {
         Round(Ic.close, Alignment.TopStart) { nav.back() }
         Round(if (torch) Ic.torchOff else Ic.torch, Alignment.TopEnd, torch) { torch = !torch }
         Txt(
-            hint,
+            if (allowed) hint else "Allow camera access to scan",
             Modifier
                 .fillMaxWidth()
                 .offset(y = maxHeight * .45f + 154.dp)

@@ -1,16 +1,18 @@
 package com.lordhck.btcwallet.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.lordhck.btcwallet.Seed
 
 @Composable
 private fun Heading(text: String) {
@@ -34,7 +36,12 @@ fun Welcome() {
                 Txt("A simple, self-custodial Bitcoin wallet.", Modifier.padding(top = 10.dp), C.soft, 15f)
             }
             Spacer(Modifier.weight(1f))
-            Primary("Create new wallet") { nav.show(S.ObSeed) }
+            Primary("Create new wallet") {
+                nav.words = Seed.generate()
+                nav.restoring = false
+                nav.seedIsNew = true
+                nav.show(S.ObSeed)
+            }
             Ghost("Restore wallet") { nav.show(S.ObRestore) }
         }
     }
@@ -43,29 +50,46 @@ fun Welcome() {
 @Composable
 fun ObSeed() {
     val nav = LocalNav.current
+    var revealed by remember { mutableStateOf(false) }
     Scr {
         Bar()
         Body {
             Heading("Your seed phrase")
             Lead("Write these 12 words down in order and keep them offline. They're the only way to recover your wallet.")
-            SeedGrid()
+            SeedGrid(nav.words.orEmpty()) { revealed = true }
             Spacer(Modifier.weight(1f))
-            Primary("I've written it down") { nav.show(S.ObVerify) }
+            Primary("I've written it down", revealed) { nav.show(S.ObVerify) }
         }
     }
 }
 
+private class Question(val position: Int, val answer: String, val options: List<String>) {
+    var picked by mutableStateOf<String?>(null)
+    val solved: Boolean get() = picked == answer
+}
+
+// Three random words, each hidden among two words not in the seed
+private fun quiz(words: List<String>): List<Question> {
+    val decoys = (Seed.generate() + Seed.generate()).filter { it !in words }.distinct().toMutableList()
+    return words.indices.shuffled().take(3).sorted().map { i ->
+        val options = listOf(words[i], decoys.removeAt(0), decoys.removeAt(0)).shuffled()
+        Question(i + 1, words[i], options)
+    }
+}
+
 @Composable
-private fun RowScope.Choice(word: String, ok: Boolean) {
-    var picked by rememberSaveable { mutableStateOf(false) }
-    val tint = if (ok) C.green else C.red
+private fun RowScope.Choice(word: String, q: Question) {
+    val picked = word == q.picked
+    val tint = if (word == q.answer) C.green else C.red
+    val shape = RoundedCornerShape(12.dp)
     Txt(
         word,
         Modifier
             .weight(1f)
-            .clip(RoundedCornerShape(12.dp))
-            .background(if (picked) tint.copy(alpha = .15f) else C.surface)
-            .press { picked = true }
+            .clip(shape)
+            .background(C.surface)
+            .then(if (picked) Modifier.border(1.5.dp, tint, shape) else Modifier)
+            .press { q.picked = word }
             .padding(horizontal = 8.dp, vertical = 13.dp),
         if (picked) tint else C.text,
         align = TextAlign.Center,
@@ -73,26 +97,22 @@ private fun RowScope.Choice(word: String, ok: Boolean) {
 }
 
 @Composable
-private fun Choices(label: String, words: List<String>, correct: Int) {
-    Gt(label)
-    Row(Modifier.fillMaxWidth(), Arrangement.spacedBy(8.dp)) {
-        words.forEachIndexed { i, w -> Choice(w, i == correct) }
-    }
-}
-
-@Composable
 fun ObVerify() {
     val nav = LocalNav.current
+    val questions = remember { quiz(nav.words.orEmpty()) }
     Scr {
         Bar()
         Body {
             Heading("Confirm your seed")
             Lead("Pick the correct words.")
-            Choices("Word #3", listOf("arrange", "orbit", "lunar"), 0)
-            Choices("Word #7", listOf("mango", "inhale", "pilot"), 1)
-            Choices("Word #11", listOf("tide", "rocket", "umbrella"), 2)
+            questions.forEach { q ->
+                Gt("Word #${q.position}")
+                Row(Modifier.fillMaxWidth(), Arrangement.spacedBy(8.dp)) {
+                    q.options.forEach { Choice(it, q) }
+                }
+            }
             Spacer(Modifier.weight(1f))
-            Primary("Continue") { nav.show(S.ObPin) }
+            Primary("Continue", questions.all { it.solved }) { nav.show(S.ObPin) }
         }
     }
 }
@@ -100,16 +120,32 @@ fun ObVerify() {
 @Composable
 fun ObRestore() {
     val nav = LocalNav.current
-    var words by rememberSaveable { mutableStateOf("") }
+    // not saveable, so the seed never lands in saved instance state
+    var text by remember { mutableStateOf("") }
+    val count = Seed.split(text).size
+    val words = Seed.parse(text)
+    val bad = (count == 12 || count == 24) && words == null
     Scr {
         Bar()
         Body {
             Heading("Restore wallet")
             Lead("Enter your 12 or 24 word seed phrase.")
-            Input(words, { words = it }, "word1 word2 word3 …", mono = true, area = true)
-            Msg(wordCount(words))
+            Input(
+                text,
+                { text = it },
+                "word1 word2 word3 …",
+                mono = true,
+                area = true,
+                keyboard = KeyboardType.Password,
+            )
+            Msg(if (bad) "That isn't a valid seed phrase" else wordCount(text), bad)
             Spacer(Modifier.weight(1f))
-            Primary("Continue") { nav.show(S.ObPin) }
+            Primary("Continue", words != null) {
+                nav.words = words
+                nav.restoring = true
+                nav.seedIsNew = false
+                nav.show(S.ObPin)
+            }
         }
     }
 }
@@ -137,7 +173,7 @@ fun ObBio() {
                 )
             }
             Spacer(Modifier.weight(1f))
-            Primary("Use biometrics", done)
+            Primary("Use biometrics", onClick = done)
             Ghost("Not now", done)
         }
     }

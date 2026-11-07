@@ -14,7 +14,6 @@ import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.GenericShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.BasicTextField
@@ -29,7 +28,6 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
@@ -46,6 +44,9 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.floor
@@ -70,8 +71,6 @@ object C {
     val red = Color(0xFFEF4444)
     val light = Color(0xFFECECEC)
 }
-
-val Oval = GenericShape { size, _ -> addOval(Rect(Offset.Zero, size)) }
 
 // ---------- text ----------
 fun style(
@@ -142,7 +141,10 @@ fun Scr(content: @Composable ColumnScope.() -> Unit) {
 @Composable
 fun Bar(title: String = "", back: Boolean = true) {
     val nav = LocalNav.current
-    Box(Modifier.fillMaxWidth().statusBarsPadding().height(56.dp), contentAlignment = Alignment.Center) {
+    Box(
+        Modifier.fillMaxWidth().statusBarsPadding().padding(top = 12.dp).height(56.dp),
+        contentAlignment = Alignment.Center,
+    ) {
         if (back) {
             Box(
                 Modifier
@@ -214,37 +216,12 @@ fun Intro(text: String) {
 }
 
 @Composable
-fun Msg(text: String) {
-    Txt(text, Modifier.padding(start = 4.dp, end = 4.dp, top = 8.dp).heightIn(min = 18.dp), C.muted, 13f)
-}
-
-@Composable
-fun Tag(text: String) {
+fun Msg(text: String, err: Boolean = false) {
     Txt(
         text,
-        Modifier
-            .background(C.accentA, RoundedCornerShape(6.dp))
-            .padding(horizontal = 9.dp, vertical = 3.dp),
-        C.accent,
-        12f,
-        600,
-    )
-}
-
-@Composable
-fun Notice(text: String, tint: Color, fg: Color, fill: Float) {
-    val shape = RoundedCornerShape(14.dp)
-    Txt(
-        text,
-        Modifier
-            .padding(top = 18.dp)
-            .fillMaxWidth()
-            .background(tint.copy(alpha = fill), shape)
-            .border(1.dp, tint.copy(alpha = .35f), shape)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
-        fg,
+        Modifier.padding(start = 4.dp, end = 4.dp, top = 8.dp).heightIn(min = 18.dp),
+        if (err) C.red else C.muted,
         13f,
-        line = 1.35f,
     )
 }
 
@@ -417,17 +394,16 @@ fun IconBtn(v: Int, color: Color = C.soft, onClick: () -> Unit) {
 }
 
 @Composable
-fun Chip(label: String, on: Boolean = false, onClick: () -> Unit) {
+fun Chip(label: String, onClick: () -> Unit) {
     Txt(
         label,
         Modifier
             .clip(RoundedCornerShape(10.dp))
-            .background(if (on) C.accent else C.surface2)
+            .background(C.surface2)
             .press(onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 9.dp),
-        if (on) Color.Black else C.soft,
+        C.soft,
         14f,
-        if (on) 600 else 400,
     )
 }
 
@@ -446,15 +422,17 @@ fun Btn(
     icon: Int? = null,
     top: Dp = 24.dp,
     pad: PaddingValues = PaddingValues(15.dp),
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     val down = if (bg == Color.Transparent) bg else lerp(bg, Color.White, .1f)
     Row(
         modifier
             .padding(top = top)
+            .alpha(if (enabled) 1f else .45f)
             .clip(RoundedCornerShape(16.dp))
             .background(bg)
-            .press(down, onClick = onClick)
+            .press(down, enabled, onClick)
             .padding(pad),
         Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
         Alignment.CenterVertically,
@@ -465,7 +443,8 @@ fun Btn(
 }
 
 @Composable
-fun Primary(label: String, onClick: () -> Unit) = Btn(label, onClick = onClick)
+fun Primary(label: String, enabled: Boolean = true, onClick: () -> Unit) =
+    Btn(label, enabled = enabled, onClick = onClick)
 
 @Composable
 fun Ghost(label: String, onClick: () -> Unit) =
@@ -473,7 +452,24 @@ fun Ghost(label: String, onClick: () -> Unit) =
 
 // ---------- seed + QR ----------
 @Composable
-private fun RowScope.SeedWord(i: Int) {
+fun Qr(text: String, side: Dp) {
+    val matrix = remember(text) {
+        QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, 0, 0, mapOf(EncodeHintType.MARGIN to 0))
+    }
+    // whole-pixel modules keep the code crisp enough to scan
+    Canvas(Modifier.size(side)) {
+        val cell = floor(size.width / matrix.width)
+        val start = floor((size.width - cell * matrix.width) / 2)
+        for (y in 0 until matrix.height) {
+            for (x in 0 until matrix.width) {
+                if (matrix[x, y]) drawRect(Color.Black, Offset(start + x * cell, start + y * cell), Size(cell, cell))
+            }
+        }
+    }
+}
+
+@Composable
+private fun RowScope.SeedWord(words: List<String>, i: Int) {
     Row(
         Modifier
             .weight(1f)
@@ -482,23 +478,23 @@ private fun RowScope.SeedWord(i: Int) {
         Arrangement.spacedBy(10.dp),
     ) {
         Txt("${i + 1}", Modifier.width(18.dp), C.muted, mono = true, align = TextAlign.End)
-        Txt(SEED[i], mono = true)
+        Txt(words[i], mono = true)
     }
 }
 
 // Hidden again each time the screen opens
 @Composable
-fun SeedGrid() {
+fun SeedGrid(words: List<String>, onReveal: () -> Unit = {}) {
     var shown by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))) {
         Column(
             Modifier.fillMaxWidth().then(if (shown) Modifier else Modifier.blur(9.dp)),
             Arrangement.spacedBy(8.dp),
         ) {
-            for (i in SEED.indices step 2) {
+            for (i in words.indices step 2) {
                 Row(Modifier.fillMaxWidth(), Arrangement.spacedBy(8.dp)) {
-                    SeedWord(i)
-                    SeedWord(i + 1)
+                    SeedWord(words, i)
+                    SeedWord(words, i + 1)
                 }
             }
         }
@@ -506,27 +502,15 @@ fun SeedGrid() {
             // blur needs Android 12, older phones get a solid cover
             val veil = C.bg.copy(alpha = if (Build.VERSION.SDK_INT >= 31) .45f else 1f)
             Column(
-                Modifier.matchParentSize().background(veil).press { shown = true },
+                Modifier.matchParentSize().background(veil).press {
+                    shown = true
+                    onReveal()
+                },
                 Arrangement.spacedBy(8.dp, Alignment.CenterVertically),
                 Alignment.CenterHorizontally,
             ) {
                 Icon(Ic.eye, color = C.soft)
                 Txt("Tap to reveal", color = C.soft, size = 14f, weight = 600)
-            }
-        }
-    }
-}
-
-// Whole-pixel modules keep the code crisp
-@Composable
-fun Qr(rows: List<String>, side: Dp) {
-    Canvas(Modifier.size(side)) {
-        val n = rows.size
-        val cell = floor(size.width / n)
-        val start = floor((size.width - cell * n) / 2)
-        rows.forEachIndexed { y, row ->
-            row.forEachIndexed { x, c ->
-                if (c == '1') drawRect(Color.Black, Offset(start + x * cell, start + y * cell), Size(cell, cell))
             }
         }
     }

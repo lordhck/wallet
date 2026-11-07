@@ -24,7 +24,7 @@ jobs:
           grep -q "versionName = \"$VERSION\"" app/build.gradle.kts \
             || { echo "::error::versionName in app/build.gradle.kts is not $VERSION"; exit 1; }
           grep -rq "const val VERSION = \"$VERSION\"" app/src/main/java \
-            || { echo "::error::VERSION in Demo.kt is not $VERSION"; exit 1; }
+            || { echo "::error::VERSION in Settings.kt is not $VERSION"; exit 1; }
 
       - name: Build the same image used locally
         run: docker build -t android -f docker/Dockerfile .
@@ -42,6 +42,7 @@ jobs:
             -v "$PWD:/workspace" \
             -e HOME=/tmp \
             -e GRADLE_USER_HOME=/workspace/.gradle \
+            -e GITHUB_SHA \
             -e KEYSTORE_FILE=/workspace/release.jks \
             -e KEYSTORE_PASSWORD \
             -e KEY_ALIAS \

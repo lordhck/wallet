@@ -11,7 +11,6 @@ object Ic {
     val close = R.drawable.ic_close
     val copy = R.drawable.ic_copy
     val del = R.drawable.ic_del
-    val donate = R.drawable.ic_donate
     val eye = R.drawable.ic_eye
     val finger = R.drawable.ic_finger
     val gear = R.drawable.ic_gear
