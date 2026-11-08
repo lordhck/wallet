@@ -53,6 +53,13 @@ class WalletModel(context: Context) {
         private set
     var payments by mutableStateOf(emptyList<Payment>())
         private set
+    // A send that is signed but not broadcast yet. Apart from payments, so a sync can't drop it.
+    var outgoing by mutableStateOf<Payment?>(null)
+        private set
+
+    // What Activity shows: a send in progress on top, then everything the wallet knows
+    val activity: List<Payment>
+        get() = listOfNotNull(outgoing) + payments.filterNot { it.id == outgoing?.id }
     var synced by mutableStateOf(false)
         private set
     // Why the server can't be reached, null when all is well
@@ -185,20 +192,27 @@ class WalletModel(context: Context) {
 
     // Lives here so leaving the screen can't lose track of a transaction.
     // A failure may mean the network dropped after the transaction went out.
-    fun send(draft: Draft, done: (Boolean) -> Unit) {
+    // signed runs once the transaction is signed and shows in Activity as Sending
+    fun send(draft: Draft, signed: () -> Unit, done: (Boolean) -> Unit) {
         scope.launch {
             val ok = try {
                 val open = checkNotNull(chain)
                 note("signing")
                 val tx = withContext(worker) { open.sign(draft) }
+                val row = withContext(worker) { open.sending(tx) }
+                if (open === chain) outgoing = row
+                signed()
                 note("broadcasting")
                 withContext(network) { open.broadcast(tx) }
                 withContext(worker) { open.record(tx) }
                 show()
+                outgoing = null
                 note("broadcast ok")
                 true
             } catch (e: Exception) {
                 note("broadcast failed: " + why(e))
+                // the next sync shows it if it went out after all
+                outgoing = null
                 false
             }
             done(ok)
@@ -350,6 +364,7 @@ class WalletModel(context: Context) {
     private fun reset() {
         sats = 0L
         payments = emptyList()
+        outgoing = null
         synced = false
         rates = null
         lastFees = 0L

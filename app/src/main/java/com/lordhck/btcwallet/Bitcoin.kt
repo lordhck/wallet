@@ -25,7 +25,6 @@ import java.math.BigDecimal
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
-import kotlin.math.abs
 import kotlin.math.ceil
 
 enum class Net(
@@ -53,8 +52,28 @@ enum class Net(
 private const val PROBE_MS = 5_000
 private const val TRUST_MS = 60_000L
 
-// sats is what the wallet gained or lost. For a payment to yourself that's only the fee.
-class Payment(val id: String, val incoming: Boolean, val sats: Long, val time: Long?, val self: Boolean)
+// How long a sent transaction is kept when the server hasn't listed it yet
+private const val KEEP_SECONDS = 600L
+
+// A payment counts as final after this many blocks
+const val FINAL_CONFIRMATIONS = 6
+
+// sats is what was received, or what was sent without the fee. For a payment to yourself
+// it's only the fee. fee is only known for sends. address is where a send went, or which
+// of ours received it. time is the block time, seen when the server last saw it unconfirmed.
+// confirmations is 0 until it is in a block. sending is true while it is still on its way to the server.
+class Payment(
+    val id: String,
+    val incoming: Boolean,
+    val sats: Long,
+    val time: Long?,
+    val self: Boolean,
+    val confirmations: Int,
+    val fee: Long?,
+    val address: String?,
+    val seen: Long?,
+    val sending: Boolean = false,
+)
 
 class Receiving(val address: String, val uri: String)
 
@@ -94,6 +113,9 @@ class Chain(dir: File, words: List<String>, private val net: Net, apis: List<Str
     private val client get() = clients[active]
     private val persister: Persister
     private val wallet: Wallet
+
+    // Sent from here and not in a block yet, with when it was sent. See keepSent().
+    private val sentHere = mutableMapOf<String, Pair<Transaction, Long>>()
 
     init {
         val key = DescriptorSecretKey(net.bdk, Mnemonic.fromString(words.joinToString(" ")), null)
@@ -182,23 +204,73 @@ class Chain(dir: File, words: List<String>, private val net: Net, apis: List<Str
 
     fun absorb(update: Update) {
         wallet.applyUpdate(update)
+        keepSent()
         wallet.persist(persister)
         Debug.note("update saved")
     }
 
+    // A sync drops an unconfirmed transaction that the server's address history doesn't
+    // list. Right after a broadcast the server often hasn't indexed it yet, so it would
+    // vanish for a minute. Seeing it again later than the drop brings it back. Gives up
+    // after KEEP_SECONDS, in case it really never reached the network.
+    private fun keepSent() {
+        if (sentHere.isEmpty()) return
+        val now = System.currentTimeMillis() / 1000
+        val txs = wallet.transactions()
+        val listed = txs.map { it.transaction.computeTxid().toString() }.toSet()
+        val confirmed = txs.filter { it.chainPosition is ChainPosition.Confirmed }
+            .map { it.transaction.computeTxid().toString() }.toSet()
+        sentHere.entries.removeAll { (id, sent) -> id in confirmed || now - sent.second > KEEP_SECONDS }
+        val dropped = sentHere.filterKeys { it !in listed }.values
+        if (dropped.isEmpty()) return
+        Debug.note("sync dropped ${dropped.size} sent transaction(s) the server hasn't listed yet, keeping them")
+        // a drop at the same second still counts, so this has to be later than the sync
+        wallet.applyUnconfirmedTxs(dropped.map { UnconfirmedTx(it.first, (now + 1).toULong()) })
+    }
+
     fun balance(): Long = wallet.balance().total.toSat().toLong()
 
-    fun payments(): List<Payment> = wallet.transactions()
-        .map { tx ->
-            val values = wallet.sentAndReceived(tx.transaction)
-            val sent = values.sent.toSat().toLong()
-            val received = values.received.toSat().toLong()
-            val time = (tx.chainPosition as? ChainPosition.Confirmed)
-                ?.confirmationBlockTime?.confirmationTime?.toLong()
-            val self = sent > 0 && tx.transaction.output().all { wallet.isMine(it.scriptPubkey) }
-            Payment(tx.transaction.computeTxid().toString(), received >= sent, abs(received - sent), time, self)
+    fun payments(): List<Payment> {
+        // each sync moves the tip forward, so the count grows with every new block
+        val tip = wallet.latestCheckpoint().height.toLong()
+        return wallet.transactions()
+            .map { tx ->
+                val block = (tx.chainPosition as? ChainPosition.Confirmed)?.confirmationBlockTime
+                val confirmations = block?.let { maxOf(1L, tip - it.blockId.height.toLong() + 1).toInt() } ?: 0
+                val seen = (tx.chainPosition as? ChainPosition.Unconfirmed)?.timestamp?.toLong()
+                payment(tx.transaction, block?.confirmationTime?.toLong(), confirmations, seen)
+            }
+            .sortedByDescending { it.time ?: Long.MAX_VALUE }
+    }
+
+    // The row for a signed transaction that hasn't reached the server yet
+    fun sending(tx: Transaction): Payment =
+        payment(tx, null, 0, System.currentTimeMillis() / 1000, sending = true)
+
+    private fun payment(tx: Transaction, time: Long?, confirmations: Int, seen: Long?, sending: Boolean = false): Payment {
+        val values = wallet.sentAndReceived(tx)
+        val sent = values.sent.toSat().toLong()
+        val received = values.received.toSat().toLong()
+        val outputs = tx.output()
+        val incoming = received >= sent
+        val self = sent > 0 && outputs.all { wallet.isMine(it.scriptPubkey) }
+        // only our own inputs have known values, so only a send has a fee to work out
+        val fee = if (sent > 0) runCatching { wallet.calculateFee(tx).toSat().toLong() }.getOrNull() else null
+        val sats = when {
+            incoming -> received - sent
+            self || fee == null -> sent - received
+            else -> sent - received - fee
         }
-        .sortedByDescending { it.time ?: Long.MAX_VALUE }
+        val shown = if (incoming || self) {
+            outputs.firstOrNull { wallet.isMine(it.scriptPubkey) }
+        } else {
+            outputs.firstOrNull { !wallet.isMine(it.scriptPubkey) }
+        }
+        val address = shown?.let { runCatching { Address.fromScript(it.scriptPubkey, net.bdk).toString() }.getOrNull() }
+        return Payment(
+            tx.computeTxid().toString(), incoming, sats, time, self, confirmations, fee, address, seen, sending,
+        )
+    }
 
     fun address(): Receiving = receiving(wallet.nextUnusedAddress(KeychainKind.EXTERNAL).address)
 
@@ -248,7 +320,9 @@ class Chain(dir: File, words: List<String>, private val net: Net, apis: List<Str
     }
 
     fun record(tx: Transaction) {
-        wallet.applyUnconfirmedTxs(listOf(UnconfirmedTx(tx, (System.currentTimeMillis() / 1000).toULong())))
+        val now = System.currentTimeMillis() / 1000
+        wallet.applyUnconfirmedTxs(listOf(UnconfirmedTx(tx, now.toULong())))
+        sentHere[tx.computeTxid().toString()] = tx to now
         wallet.persist(persister)
     }
 

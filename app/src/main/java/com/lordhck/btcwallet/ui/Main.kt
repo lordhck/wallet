@@ -18,6 +18,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -33,12 +34,14 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.scale
@@ -68,6 +71,7 @@ import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.QRCodeReader
 import com.lordhck.btcwallet.Debug
 import com.lordhck.btcwallet.Draft
+import com.lordhck.btcwallet.FINAL_CONFIRMATIONS
 import com.lordhck.btcwallet.Money
 import com.lordhck.btcwallet.Net
 import com.lordhck.btcwallet.Payment
@@ -83,11 +87,28 @@ import kotlin.math.roundToInt
 
 // ---------- home ----------
 @Composable
+private fun Spinner() {
+    val turn by rememberInfiniteTransition(label = "spin").animateFloat(
+        0f, 360f, infiniteRepeatable(tween(1000, easing = LinearEasing)), label = "turn",
+    )
+    Canvas(Modifier.size(12.dp)) {
+        val w = 2.dp.toPx()
+        val inner = Size(size.width - w, size.height - w)
+        drawArc(C.surface3, 0f, 360f, false, Offset(w / 2, w / 2), inner, style = Stroke(w))
+        drawArc(C.accent, turn, 90f, false, Offset(w / 2, w / 2), inner, style = Stroke(w, cap = StrokeCap.Round))
+    }
+}
+
+@Composable
 private fun PaymentRow(payment: Payment, amount: String, price: Double?, divider: Boolean, onClick: () -> Unit) {
-    val pending = payment.time == null
-    val sub = payment.time?.let {
-        "Confirmed · " + SimpleDateFormat("d MMM", Locale.getDefault()).format(Date(it * 1000))
-    } ?: if (payment.incoming) "Unconfirmed" else "Broadcast"
+    // stays highlighted until the payment is final
+    val pending = payment.confirmations < FINAL_CONFIRMATIONS
+    val sub = when {
+        payment.sending -> "Sending…"
+        payment.confirmations == 0 -> if (payment.incoming) "Unconfirmed" else "Broadcast"
+        pending -> "${payment.confirmations} of $FINAL_CONFIRMATIONS confirmations"
+        else -> "Confirmed · " + SimpleDateFormat("d MMM", Locale.getDefault()).format(Date(payment.time!! * 1000))
+    }
     if (divider) Spacer(Modifier.fillMaxWidth().height(1.dp).background(C.line))
     Row(
         Modifier.fillMaxWidth().press(onClick = onClick).padding(horizontal = 4.dp, vertical = 12.dp),
@@ -111,7 +132,10 @@ private fun PaymentRow(payment: Payment, amount: String, price: Double?, divider
                 },
                 weight = 600,
             )
-            Txt(sub, Modifier.padding(top = 2.dp), if (pending) C.accent else C.muted, 13f)
+            Row(Modifier.padding(top = 2.dp), Arrangement.spacedBy(6.dp), Alignment.CenterVertically) {
+                if (payment.sending) Spinner()
+                Txt(sub, color = if (pending) C.accent else C.muted, size = 13f)
+            }
         }
         Column(horizontalAlignment = Alignment.End) {
             Txt(
@@ -125,6 +149,164 @@ private fun PaymentRow(payment: Payment, amount: String, price: Double?, divider
             } else if (price != null) {
                 Txt(Money.usd(payment.sats, price), Modifier.padding(top = 2.dp), C.muted, 13f)
             }
+        }
+    }
+}
+
+private fun stage(payment: Payment): String = when {
+    payment.sending -> "Sending…"
+    payment.confirmations == 0 -> if (payment.incoming) "Unconfirmed" else "Broadcast"
+    payment.confirmations < FINAL_CONFIRMATIONS -> "${payment.confirmations} of $FINAL_CONFIRMATIONS"
+    else -> "Confirmed"
+}
+
+private fun day(payment: Payment): String {
+    val at = payment.time ?: payment.seen ?: return "Just now"
+    val date = Date(at * 1000)
+    val key = SimpleDateFormat("yyyyMMdd", Locale.US)
+    val clock = SimpleDateFormat("HH:mm", Locale.getDefault()).format(date)
+    if (key.format(date) == key.format(Date())) return "Today, $clock"
+    return SimpleDateFormat("d MMM", Locale.getDefault()).format(date) + ", " + clock
+}
+
+private fun short(text: String, keep: Int) =
+    if (text.length <= keep * 2 + 1) text else text.take(keep) + "…" + text.takeLast(keep)
+
+@Composable
+private fun Line(key: String, value: String, mono: Boolean = false) {
+    Row(Modifier.fillMaxWidth(), Arrangement.spacedBy(12.dp)) {
+        Txt(key, color = C.muted, size = 14.5f)
+        Txt(value, Modifier.weight(1f), C.soft, if (mono) 13.5f else 14.5f, mono = mono, align = TextAlign.End, tabular = true)
+    }
+}
+
+// Card at the bottom of Home for one payment. Slides up from the bottom.
+// Tap outside, swipe down or Back slides it away.
+@Composable
+private fun BoxScope.TxCard(payment: Payment, amount: (Long) -> String, price: Double?, explorer: String, onClose: () -> Unit) {
+    val nav = LocalNav.current
+    val clipboard = LocalClipboardManager.current
+    val uris = LocalUriHandler.current
+    val scope = rememberCoroutineScope()
+    val final = payment.confirmations >= FINAL_CONFIRMATIONS
+    // 1 is fully below the screen, 0 is in place
+    val out = remember { Animatable(1f) }
+    var height by remember { mutableIntStateOf(0) }
+    var drag by remember { mutableFloatStateOf(0f) }
+    var closing by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { out.animateTo(0f, tween(260, easing = FastOutSlowInEasing)) }
+    val close: () -> Unit = {
+        if (!closing) {
+            closing = true
+            scope.launch {
+                // carry on from wherever a swipe left it
+                val from = if (height > 0) (drag / height).coerceIn(0f, 1f) else 0f
+                drag = 0f
+                out.snapTo(maxOf(out.value, from))
+                out.animateTo(1f, tween(200, easing = FastOutLinearInEasing))
+                onClose()
+            }
+        }
+    }
+    BackHandler(onBack = close)
+    Box(
+        Modifier
+            .fillMaxSize()
+            .graphicsLayer { alpha = 1f - out.value }
+            .background(Color.Black.copy(alpha = .5f))
+            .press(onClick = close),
+    )
+    Column(
+        Modifier
+            .align(Alignment.BottomCenter)
+            .onSizeChanged { height = it.height }
+            // its height isn't known on the first frame, so it would flash in place
+            .graphicsLayer { alpha = if (height == 0) 0f else 1f }
+            .offset { IntOffset(0, (drag + out.value * height * 1.1f).roundToInt()) }
+            .navigationBarsPadding()
+            .padding(8.dp)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(26.dp))
+            .background(C.surface)
+            .press { }
+            .pointerInput(Unit) {
+                detectVerticalDragGestures(
+                    onDragEnd = { if (drag > 80.dp.toPx()) close() else drag = 0f },
+                    onDragCancel = { drag = 0f },
+                ) { _, dy -> drag = maxOf(0f, drag + dy) }
+            }
+            .padding(start = 18.dp, end = 18.dp, top = 10.dp, bottom = 18.dp),
+    ) {
+        Box(
+            Modifier
+                .align(Alignment.CenterHorizontally)
+                .padding(bottom = 18.dp)
+                .size(36.dp, 4.dp)
+                .background(C.surface3, RoundedCornerShape(2.dp)),
+        )
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+            Box(
+                Modifier
+                    .size(46.dp)
+                    .background(if (payment.incoming) C.green.copy(alpha = .12f) else C.surface2, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(if (payment.incoming) Ic.txIn else Ic.txOut, 20.dp, if (payment.incoming) C.green else C.soft)
+            }
+            Column(Modifier.weight(1f)) {
+                Txt(
+                    (if (payment.incoming) "+" else "−") + amount(payment.sats),
+                    color = if (payment.incoming) C.green else C.text,
+                    size = 24f,
+                    weight = 700,
+                    tabular = true,
+                )
+                if (price != null) {
+                    Txt("≈ " + Money.usd(payment.sats, price), Modifier.padding(top = 2.dp), C.muted, 13.5f, tabular = true)
+                }
+            }
+            Row(
+                Modifier.height(28.dp).background(C.surface2, CircleShape).padding(start = 10.dp, end = 11.dp),
+                Arrangement.spacedBy(6.dp),
+                Alignment.CenterVertically,
+            ) {
+                Box(Modifier.size(7.dp).background(if (final) C.green else C.accent, CircleShape))
+                Txt(stage(payment), color = if (final) C.soft else C.accent, size = 13f, weight = 600)
+            }
+        }
+        Spacer(Modifier.padding(top = 20.dp).fillMaxWidth().height(1.dp).background(C.surface3))
+        Column(Modifier.padding(top = 16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Line(if (payment.incoming) "Received on" else "Sent to", payment.address?.let { short(it, 8) } ?: "—", mono = true)
+            Line("Network fee", if (payment.incoming) "Paid by sender" else payment.fee?.let { Money.sats(it) } ?: "—")
+            Line("Date", day(payment))
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                Txt("Transaction", color = C.muted, size = 14.5f)
+                Row(
+                    Modifier.press {
+                        clipboard.setText(AnnotatedString(payment.id))
+                        nav.toast("Transaction ID copied")
+                    },
+                    Arrangement.spacedBy(5.dp),
+                    Alignment.CenterVertically,
+                ) {
+                    Txt(short(payment.id, 6), color = C.soft, size = 13.5f, mono = true)
+                    Icon(Ic.copy, 15.dp, C.dim)
+                }
+            }
+        }
+        Row(
+            Modifier
+                .padding(top = 22.dp)
+                .fillMaxWidth()
+                .height(52.dp)
+                .clip(CircleShape)
+                .background(C.surface3)
+                .press(C.focus, !payment.sending) { uris.openUri(explorer + payment.id) },
+            Arrangement.spacedBy(7.dp, Alignment.CenterHorizontally),
+            Alignment.CenterVertically,
+        ) {
+            Txt("View transaction", size = 15f, weight = 600)
+            Icon(Ic.txOut, 16.dp, C.text)
         }
     }
 }
@@ -167,7 +349,8 @@ private fun HomeContent() {
     val nav = LocalNav.current
     val wallet = nav.wallet
     val net = wallet.net
-    val uris = LocalUriHandler.current
+    // id of the payment whose card is open
+    var details by remember { mutableStateOf<String?>(null) }
     // test coins have no dollar value
     val price = if (net == Net.Main) wallet.price else null
     // starts over when a setting or the first price changes the list
@@ -223,12 +406,14 @@ private fun HomeContent() {
                     .padding(start = 16.dp, end = 16.dp, bottom = 24.dp),
             ) {
                 Gt("Activity", first = true)
-                if (wallet.payments.isEmpty()) {
+                val activity = wallet.activity
+                if (activity.isEmpty()) {
                     Txt("No transactions yet", Modifier.padding(start = 4.dp, top = 4.dp), C.muted, 14f)
                 }
-                wallet.payments.forEachIndexed { i, payment ->
+                activity.forEachIndexed { i, payment ->
                     PaymentRow(payment, wallet.amount(payment.sats), price, i > 0) {
-                        uris.openUri(net.explorer + payment.id)
+                        // nothing to look up until the broadcast is done
+                        if (!payment.sending) details = payment.id
                     }
                 }
             }
@@ -242,6 +427,10 @@ private fun HomeContent() {
                 .padding(8.dp),
         ) { Icon(Ic.gear, 24.dp, C.soft) }
         if (net != Net.Main) TestBadge(net.label)
+        // looked up by id, so the card follows new confirmations and closes on a network switch
+        wallet.activity.firstOrNull { it.id == details }?.let { payment ->
+            TxCard(payment, wallet::amount, price, net.explorer) { details = null }
+        }
     }
 }
 
@@ -550,14 +739,20 @@ fun Send() {
                 onClose = { draft = null },
                 onSlid = {
                     sending = true
-                    wallet.send(ready) { ok ->
-                        sending = false
-                        draft = null
-                        if (ok) {
+                    wallet.send(
+                        ready,
+                        signed = {
+                            // Activity shows the send as it goes out
+                            sending = false
+                            draft = null
                             addr = ""
                             amount = ""
                             all = false
                             nav.root(S.Home)
+                        },
+                    ) { ok ->
+                        sending = false
+                        if (ok) {
                             nav.toast("Transaction broadcast")
                         } else {
                             nav.toast("Sending failed. Check Activity first")
