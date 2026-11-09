@@ -11,6 +11,10 @@
   h1 { color: #fff; }
   a { color: #6fa8ff; }
   a:visited { color: #b48cff; }
+  /* arrow from bottom left to top right, drawn in the link's own color */
+  a.out span::after { content: ""; display: inline-block; width: .7em; height: .7em; margin-left: .15em; vertical-align: .05em; background: currentColor;
+    -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 18L18 6M9 6h9v9'/%3E%3C/svg%3E") center / contain no-repeat;
+            mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 18L18 6M9 6h9v9'/%3E%3C/svg%3E") center / contain no-repeat; }
   pre { white-space: pre-wrap; word-break: break-word; }
   code { font-size: 0.8rem; word-break: break-all; }
   /* logo is 86 columns: scale the font so it always fits the screen */
@@ -40,7 +44,7 @@ Download: coming soon
 <!-- release:end -->
 
 <p>
-<b>Links:</b> <a href="https://github.com/lordhck/wallet">[ source ]</a> <a href="https://lordhck.com">[ website ]</a>
+<b>Links:</b> <a class="out" href="https://github.com/lordhck/wallet" target="_blank" rel="noopener">[ <span>source</span> ]</a> <a class="out" href="https://lordhck.com" target="_blank" rel="noopener">[ <span>website</span> ]</a>
 </p>
 
 <hr>
@@ -65,7 +69,7 @@ No accounts. No ads. No tracking. Free and open source.
 Nothing released yet.
 <!-- changelog:end -->
 
-<p>Technical whitepaper: <a href="https://github.com/lordhck/wallet/docs/whitepaper.md">docs/whitepaper.md</a></p>
+<p>Technical whitepaper: <a href="https://github.com/lordhck/wallet/blob/main/docs/whitepaper.md">docs/whitepaper.md</a></p>
 <i>Not your keys, not your coins.</i>
 </pre>
 
