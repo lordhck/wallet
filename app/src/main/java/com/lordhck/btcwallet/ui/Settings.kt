@@ -309,7 +309,7 @@ fun Server() {
         Bar("Server")
         Body {
             Big("Server")
-            Intro("Balance and history come from a server with the Esplora API: blockstream.info by default, with a backup server if it can't be reached, or your own electrs. Leave empty for the default. The USD price comes from Coinbase, or Kraken as a backup.")
+            Intro("Balance and history come from a server with the Esplora API: blockstream.info by default, with mempool.space as backup if it can't be reached, or your own electrs. Leave empty for the default. The USD price comes from Coinbase, or Kraken as a backup.")
             Input(
                 url,
                 {

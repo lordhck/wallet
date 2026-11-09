@@ -207,11 +207,17 @@ fun App(start: String?) {
         var stopped = 0L
         val observer = LifecycleEventObserver { _, event ->
             Debug.note("app ${event.name}")
-            if (event == Lifecycle.Event.ON_STOP) stopped = SystemClock.elapsedRealtime()
+            if (event == Lifecycle.Event.ON_STOP) {
+                stopped = SystemClock.elapsedRealtime()
+                nav.wallet.stopped()
+            }
             if (event == Lifecycle.Event.ON_START && stopped > 0 && nav.words != null &&
                 SystemClock.elapsedRealtime() - stopped > AUTO_LOCK_MS
             ) {
                 nav.lock()
+            } else if (event == Lifecycle.Event.ON_START) {
+                // picks up a sync the background cut short, without waiting for the next tick
+                nav.wallet.refresh()
             }
         }
         owner.lifecycle.addObserver(observer)

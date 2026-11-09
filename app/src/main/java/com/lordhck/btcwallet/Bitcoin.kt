@@ -6,6 +6,7 @@ import org.bitcoindevkit.ChainPosition
 import org.bitcoindevkit.Descriptor
 import org.bitcoindevkit.DescriptorSecretKey
 import org.bitcoindevkit.EsploraClient
+import org.bitcoindevkit.EsploraException
 import org.bitcoindevkit.FeeRate
 import org.bitcoindevkit.FullScanScriptInspector
 import org.bitcoindevkit.KeychainKind
@@ -14,6 +15,7 @@ import org.bitcoindevkit.Network
 import org.bitcoindevkit.Persister
 import org.bitcoindevkit.Psbt
 import org.bitcoindevkit.Script
+import org.bitcoindevkit.SyncScriptInspector
 import org.bitcoindevkit.Transaction
 import org.bitcoindevkit.TxBuilder
 import org.bitcoindevkit.UnconfirmedTx
@@ -25,6 +27,8 @@ import java.math.BigDecimal
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import org.json.JSONObject
 import kotlin.math.ceil
 
 enum class Net(
@@ -37,20 +41,69 @@ enum class Net(
 ) {
     Main(
         "Mainnet", Network.BITCOIN, "https://blockstream.info/api", "BTC",
-        "https://blockstream.info/tx/", "https://mempool.emzy.de/api",
+        "https://mempool.space/tx/", "https://mempool.space/api",
     ),
     Signet(
         "Signet", Network.SIGNET, "https://blockstream.info/signet/api", "sBTC",
-        "https://blockstream.info/signet/tx/", "https://mempool.space/signet/api",
+        "https://mempool.space/signet/tx/", "https://mempool.space/signet/api",
     ),
     Testnet(
         "Testnet", Network.TESTNET4, "https://blockstream.info/testnet4/api", "tBTC",
-        "https://blockstream.info/testnet4/tx/", "https://mempool.emzy.de/testnet4/api",
+        "https://mempool.space/testnet4/tx/", "https://mempool.space/testnet4/api",
     ),
 }
 
 private const val PROBE_MS = 5_000
 private const val TRUST_MS = 60_000L
+
+// How long a server that answered 429 Too Many Requests is left alone
+private const val REST_MS = 600_000L
+
+// How long a server that stopped answering mid-sync is left alone at first.
+// Doubles with each stall in a row, up to an hour.
+private const val STALL_REST_MS = 300_000L
+private const val STALL_REST_MAX_MS = 3_600_000L
+
+// Which servers are resting, by host. Kept for the whole app, not per Chain:
+// a new Chain opens on every unlock and network switch, and the 2026-11-09 log
+// showed each unlock asking the stalled mempool.space first again and waiting
+// 20 s on it. By host, because mempool.space stalled on Mainnet and Signet alike.
+private object Rest {
+    private val until = ConcurrentHashMap<String, Long>()
+    private val stalls = ConcurrentHashMap<String, Int>()
+
+    private fun host(server: String) = runCatching { URL(server).host }.getOrDefault(server)
+
+    fun resting(server: String, now: Long) = (until[host(server)] ?: 0L) > now
+
+    fun limited(server: String, now: Long) {
+        until[host(server)] = now + REST_MS
+    }
+
+    // Returns how long it rests
+    fun stalled(server: String, now: Long): Long {
+        val count = stalls.merge(host(server), 1, Int::plus) ?: 1
+        val rest = minOf(STALL_REST_MAX_MS, STALL_REST_MS shl minOf(count - 1, 4))
+        until[host(server)] = now + rest
+        return rest
+    }
+
+    fun answered(server: String) {
+        stalls.remove(host(server))
+    }
+}
+
+// Time between address requests. BDK has no rate setting, but it asks the
+// inspector about each address right before requesting it, so a pause there
+// spaces the requests out. Seen in the 2026-11-08 log: 2.5 requests a second
+// made mempool.space stop answering.
+private const val PACE_MS = 1_000L
+
+class RateLimited : Exception("every server is resting after errors")
+
+// BDK retries a 429 six times by itself, then hands it to us
+fun rateLimited(e: Throwable) =
+    e is RateLimited || (e is EsploraException.HttpResponse && e.status.toInt() == 429)
 
 // How long a sent transaction is kept when the server hasn't listed it yet
 private const val KEEP_SECONDS = 600L
@@ -110,6 +163,7 @@ class Chain(dir: File, words: List<String>, private val net: Net, apis: List<Str
 
     @Volatile
     private var lastAnswer = 0L
+
     private val client get() = clients[active]
     private val persister: Persister
     private val wallet: Wallet
@@ -140,18 +194,24 @@ class Chain(dir: File, words: List<String>, private val net: Net, apis: List<Str
             val inspector = object : FullScanScriptInspector {
                 override fun inspect(keychain: KeychainKind, index: UInt, script: Script) {
                     Debug.note("scan checking $keychain address #$index")
+                    Thread.sleep(PACE_MS)
                 }
             }
             val request = wallet.startFullScan().inspectSpksForAllKeychains(inspector).build()
             val server = client
-            return { server.fullScan(request, 20uL, 2uL) }
+            return { server.fullScan(request, 20uL, 1uL) }
         }
         val unused = wallet.derivationIndex(KeychainKind.EXTERNAL) == null &&
             wallet.derivationIndex(KeychainKind.INTERNAL) == null
         if (unused) return null
-        val request = wallet.startSyncWithRevealedSpks().build()
+        val inspector = object : SyncScriptInspector {
+            override fun inspect(script: Script, total: ULong) {
+                Thread.sleep(PACE_MS)
+            }
+        }
+        val request = wallet.startSyncWithRevealedSpks().inspectSpks(inspector).build()
         val server = client
-        return { server.sync(request, 2uL) }
+        return { server.sync(request, 1uL) }
     }
 
     // For the debug log: never includes keys or addresses
@@ -165,44 +225,71 @@ class Chain(dir: File, words: List<String>, private val net: Net, apis: List<Str
     private fun serverName() =
         servers[active].takeIf { it == net.api || it == net.backup } ?: "custom"
 
-    // Esplora calls wait forever on a dead connection, so ask each server first
-    // with a short timeout. Runs on the network lane. Sticks with one that works.
+    // Ask each server first with a short timeout. Runs on the network lane.
+    // Sticks with one that works, and skips one that is resting after a 429.
+    // Throws RateLimited without a request when every server is resting.
+    // Synchronized so a sync and a fee request starting together probe once.
+    @Synchronized
     fun pickServer() {
-        if (SystemClock.elapsedRealtime() - lastAnswer < TRUST_MS) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastAnswer < TRUST_MS && !Rest.resting(servers[active], now)) return
+        var limited = false
         for (step in servers.indices) {
             val index = (active + step) % servers.size
-            if (reachable(servers[index])) {
-                active = index
-                lastAnswer = SystemClock.elapsedRealtime()
-                return
+            if (Rest.resting(servers[index], now)) {
+                limited = true
+                continue
+            }
+            when (probe(servers[index])) {
+                200 -> {
+                    active = index
+                    lastAnswer = now
+                    return
+                }
+                429 -> {
+                    Rest.limited(servers[index], now)
+                    limited = true
+                }
             }
         }
+        if (limited) throw RateLimited()
         error("no server answered")
     }
 
-    // A call failed, so the next one should check again
-    fun distrust() {
+    // A call failed, so the next one should check again. After a 429 or a
+    // request that got no answer, the server rests and the next call goes to the
+    // other one. Its quick check still answers then, so it can't tell.
+    fun distrust(e: Exception) {
         lastAnswer = 0L
+        if (e is RateLimited) return
+        val now = SystemClock.elapsedRealtime()
+        val rest = when {
+            rateLimited(e) -> REST_MS.also { Rest.limited(servers[active], now) }
+            e is EsploraException.Minreq && "timeout" in e.errorMessage -> Rest.stalled(servers[active], now)
+            else -> return
+        }
+        Debug.note("server ${serverName()} isn't answering, leaving it alone for ${rest / 60_000} min")
     }
 
-    private fun reachable(server: String): Boolean {
+    // The HTTP status, or -1 when there was no answer
+    private fun probe(server: String): Int {
         val name = server.takeIf { it == net.api || it == net.backup } ?: "custom"
         val connection = URL("$server/blocks/tip/height").openConnection() as HttpURLConnection
         connection.connectTimeout = PROBE_MS
         connection.readTimeout = PROBE_MS
         return try {
-            val ok = connection.responseCode == 200
-            Debug.note("server $name answered ${connection.responseCode}")
-            ok
+            connection.responseCode.also { Debug.note("server $name answered $it") }
         } catch (e: Exception) {
             Debug.note("server $name failed: " + Debug.why(e))
-            false
+            -1
         } finally {
             connection.disconnect()
         }
     }
 
     fun absorb(update: Update) {
+        // a stall streak ends when the server delivers
+        Rest.answered(servers[active])
         wallet.applyUpdate(update)
         keepSent()
         wallet.persist(persister)
@@ -286,13 +373,31 @@ class Chain(dir: File, words: List<String>, private val net: Net, apis: List<Str
     fun feeRates(): List<Long> {
         pickServer()
         Debug.note("fees: asking ${serverName()}")
-        val estimates = client.getFeeEstimates()
+        val estimates = feeEstimates(servers[active])
         Debug.note("fees: got ${estimates.size} estimates")
         val rates = listOf(6, 3, 1).map { blocks ->
-            maxOf(1L, ceil(estimates[blocks.toUShort()] ?: 1.0).toLong())
+            maxOf(1L, ceil(estimates[blocks] ?: 1.0).toLong())
         }
         // test coins have no value, and small faucet amounts can't pay real estimates
         return if (net == Net.Main) rates else listOf(1L, 1L, rates.last())
+    }
+
+    // Not through BDK: its client only accepts status 200, and mempool.space
+    // answers this one with 203 and the same JSON.
+    private fun feeEstimates(server: String): Map<Int, Double> {
+        val connection = URL("$server/fee-estimates").openConnection() as HttpURLConnection
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 10_000
+        return try {
+            val status = connection.responseCode
+            if (status !in 200..299) {
+                throw EsploraException.HttpResponse(status.toUShort(), "fee estimates")
+            }
+            val json = JSONObject(connection.inputStream.bufferedReader().readText())
+            json.keys().asSequence().associate { it.toInt() to json.getDouble(it) }
+        } finally {
+            connection.disconnect()
+        }
     }
 
     // Null sats sends everything. Nothing leaves the phone until send()

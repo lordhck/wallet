@@ -8,6 +8,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -22,8 +23,18 @@ import java.net.URL
 import java.util.concurrent.Executors
 
 private const val SEED_NEW = "seed-new"
-private const val SYNC_GAP_MS = 28_000L
-private const val FEE_GAP_MS = 600_000L
+// Fast while something is on its way, slow otherwise. Each sync costs about one
+// request per address the wallet has handed out.
+private const val SYNC_FAST_MS = 28_000L
+private const val SYNC_IDLE_MS = 300_000L
+
+// How long Receive keeps syncs fast after it shows an address
+private const val WATCH_MS = 600_000L
+
+// Sending… stays at least this long in Activity, however fast the broadcast
+private const val SENDING_MIN_MS = 1_500L
+// Fees are only fetched when Send opens, at most once a minute
+private const val FEE_GAP_MS = 60_000L
 private const val PRICE_GAP_MS = 900_000L
 
 // What the screens show, kept in step with the open Chain
@@ -46,6 +57,17 @@ class WalletModel(context: Context) {
     private var lastPrice = 0L
     private var lastFees = 0L
     private var misses = 0
+    private var watchUntil = 0L
+
+    // Counts trips to the background. Android cuts a background app's network,
+    // always with battery saver on, so a sync that fails across one says nothing
+    // about the server. Seen in the 2026-11-09 log: a connection abort and a DNS
+    // failure within seconds of ON_STOP, each counted as a server failure.
+    private var stops = 0
+
+    // The last sync's server call. A blocking call can't be cancelled, so a new
+    // sync waits for it to end instead of adding requests on top.
+    private var inFlight: Job? = null
 
     var net by mutableStateOf(Net.values().firstOrNull { it.name == prefs.getString("net", null) } ?: Net.Main)
         private set
@@ -61,6 +83,9 @@ class WalletModel(context: Context) {
     val activity: List<Payment>
         get() = listOfNotNull(outgoing) + payments.filterNot { it.id == outgoing?.id }
     var synced by mutableStateOf(false)
+        private set
+    // A sync has finished since the wallet opened, so what Home shows is current
+    var ready by mutableStateOf(false)
         private set
     // Why the server can't be reached, null when all is well
     var offline by mutableStateOf<String?>(null)
@@ -95,7 +120,8 @@ class WalletModel(context: Context) {
         "wallet open: " + (chain != null),
         "seed made here: " + prefs.getBoolean(SEED_NEW, false),
         "full scan done: " + Net.values().joinToString { it.label + " " + prefs.getBoolean(scannedKey(it), false) },
-        "synced: $synced, syncing: $syncing, failures in a row: $misses",
+        "synced: $synced, ready: $ready, syncing: $syncing, failures in a row: $misses",
+        "request timeout: " + (System.getenv("MINREQ_TIMEOUT")?.let { it + "s" } ?: "none"),
         "last sync: " + if (lastSync == 0L) "never" else "${(SystemClock.elapsedRealtime() - lastSync) / 1000}s ago",
         "server problem: " + (offline ?: "none"),
         "wallet error: " + (error ?: "none"),
@@ -145,6 +171,7 @@ class WalletModel(context: Context) {
         note("currency $value, price known: ${price != null}")
         currency = value
         prefs.edit().putString("currency", value).apply()
+        shown = fromSettings()
         if (price == null) loadPrice()
     }
 
@@ -152,7 +179,27 @@ class WalletModel(context: Context) {
         note("unit $value")
         unit = value
         prefs.edit().putString("unit", value).apply()
+        shown = fromSettings()
     }
+
+    // How amounts show right now: "USD", "BTC" or "sats". Tapping the balance moves
+    // it on, and Activity, the transaction card, Send and review all follow. Settings
+    // aren't changed, and changing one there starts over from it.
+    var shown by mutableStateOf(fromSettings())
+        private set
+
+    private fun fromSettings() = if (currency == "USD") "USD" else unit
+
+    fun display(next: String) {
+        note("amounts shown in $next")
+        shown = next
+    }
+
+    private fun usd(value: Long): String? = price?.takeIf { net == Net.Main }?.let { Money.usd(value, it) }
+
+    // In the Bitcoin unit from Settings
+    private fun coin(value: Long): String =
+        if (unit == "sats") Money.sats(value) else Money.btc(value) + " " + net.coin
 
     fun chooseHidden(value: Boolean) {
         note("hide balance $value")
@@ -166,9 +213,19 @@ class WalletModel(context: Context) {
         prefs.edit().putBoolean("screenshot-protection", value).apply()
     }
 
-    // An amount in the chosen Bitcoin unit
-    fun amount(value: Long): String =
-        if (unit == "sats") Money.sats(value) else Money.btc(value) + " " + net.coin
+    // An amount the way amounts show right now. USD falls back to the Bitcoin unit
+    // where there's no price, like on test networks.
+    fun amount(value: Long): String = when (shown) {
+        "USD" -> usd(value) ?: coin(value)
+        "sats" -> Money.sats(value)
+        else -> Money.btc(value) + " " + net.coin
+    }
+
+    // The smaller line under an amount: USD, or the Bitcoin amount when USD is the main one
+    fun alt(value: Long): String? {
+        val dollars = usd(value)
+        return if (shown == "USD" && dollars != null) coin(value) else dollars
+    }
 
     // Empty goes back to the default server for this network
     fun chooseServer(url: String) {
@@ -201,13 +258,16 @@ class WalletModel(context: Context) {
                 val tx = withContext(worker) { open.sign(draft) }
                 val row = withContext(worker) { open.sending(tx) }
                 if (open === chain) outgoing = row
+                val shown = SystemClock.elapsedRealtime()
                 signed()
                 note("broadcasting")
                 withContext(network) { open.broadcast(tx) }
                 withContext(worker) { open.record(tx) }
-                show()
-                outgoing = null
                 note("broadcast ok")
+                show()
+                // a broadcast often takes under a second, too short to see Sending…
+                delay(maxOf(0L, SENDING_MIN_MS - (SystemClock.elapsedRealtime() - shown)))
+                outgoing = null
                 true
             } catch (e: Exception) {
                 note("broadcast failed: " + why(e))
@@ -220,22 +280,37 @@ class WalletModel(context: Context) {
         }
     }
 
+    fun stopped() {
+        stops++
+    }
+
+    // Receive shows an address, so a payment may be coming
+    fun watch() {
+        watchUntil = SystemClock.elapsedRealtime() + WATCH_MS
+    }
+
     // Force is for when something changed. Otherwise this keeps server use low,
     // however often Home is opened.
     fun refresh(force: Boolean = false) {
         val now = SystemClock.elapsedRealtime()
         if (now - lastPrice > PRICE_GAP_MS) loadPrice()
         // Home can get here first while the wallet is still opening
-        loadFees()
         val open = chain
         if (open == null) {
             note("sync skipped: wallet not open yet")
             return
         }
         // waits longer after each failure, up to about 4 minutes
-        val gap = SYNC_GAP_MS shl minOf(misses, 3)
+        // not ready yet, like a restore whose scan failed, also counts as pending
+        val pending = !ready || outgoing != null || payments.any { it.confirmations == 0 } || now < watchUntil
+        val gap = maxOf(if (pending) SYNC_FAST_MS else SYNC_IDLE_MS, SYNC_FAST_MS shl minOf(misses, 3))
         if (syncing) {
             note("sync skipped: one is still running")
+            return
+        }
+        // isActive turns false on cancel while the thread is still blocked, isCompleted doesn't
+        if (inFlight?.isCompleted == false) {
+            note("sync skipped: the last server call hasn't ended")
             return
         }
         if (!force && lastSync > 0 && now - lastSync < gap) {
@@ -244,6 +319,7 @@ class WalletModel(context: Context) {
         }
         syncing = true
         lastSync = now
+        val trip = stops
         val target = net
         val full = needsScan(target)
         scope.launch {
@@ -258,13 +334,15 @@ class WalletModel(context: Context) {
                     // a blocking call can't be cancelled, so it runs outside the
                     // timeout's scope and a stuck server is simply left behind
                     val job = scope.async(network) { scan() }
+                    inFlight = job
                     scope.launch {
                         while (job.isActive) {
                             delay(10_000)
                             if (job.isActive) note("still waiting on the server, ${took()}s")
                         }
                     }
-                    val update = withTimeoutOrNull(if (full) 180_000L else 60_000L) { job.await() }
+                    // each request ends within MINREQ_TIMEOUT, this is only a backstop
+                    val update = withTimeoutOrNull(if (full) 600_000L else 180_000L) { job.await() }
                     if (update == null) job.cancel()
                     checkNotNull(update) { "timed out" }
                     withContext(worker) { open.absorb(update) }
@@ -275,27 +353,38 @@ class WalletModel(context: Context) {
                 if (open === chain) {
                     show()
                     synced = true
+                    ready = true
                     misses = 0
                     offline = null
                 }
             } catch (e: Exception) {
-                note("failed after ${took()}s: " + why(e))
-                open.distrust()
-                if (open === chain) {
-                    // one failed request isn't worth showing
-                    misses++
-                    if (misses > 1) offline = (e.message ?: e.javaClass.simpleName).take(80)
+                if (stops != trip) {
+                    note("failed after ${took()}s with the app in the background, not counted: " + why(e))
+                    // runs again as soon as the app is back
+                    if (open === chain) lastSync = 0L
+                } else {
+                    note("failed after ${took()}s: " + why(e))
+                    open.distrust(e)
+                    if (open === chain) {
+                        // one failed request isn't worth showing, a rate limit is
+                        misses++
+                        if (e is RateLimited) {
+                            offline = "The servers aren't answering. Trying again in a few minutes."
+                        } else if (misses > 1) {
+                            offline = (e.message ?: e.javaClass.simpleName).take(80)
+                        }
+                    }
                 }
             }
             if (open === chain) syncing = false
         }
     }
 
-    // Force is for when Send opens with no fees yet
-    fun loadFees(force: Boolean = false) {
+    // Called when Send opens. The last rates stay on screen until new ones arrive.
+    fun loadFees() {
         val open = chain ?: return
         val now = SystemClock.elapsedRealtime()
-        if (lastFees > 0 && now - lastFees < FEE_GAP_MS && !(force && rates == null)) return
+        if (lastFees > 0 && now - lastFees < FEE_GAP_MS) return
         lastFees = now
         scope.launch {
             try {
@@ -303,8 +392,10 @@ class WalletModel(context: Context) {
                 note("fees: $fresh sat/vB")
                 if (open === chain) rates = fresh
             } catch (e: Exception) {
-                open.distrust()
+                open.distrust(e)
                 note("fees failed: " + why(e))
+                // opening Send again may try again
+                if (open === chain) lastFees = 0L
             }
         }
     }
@@ -343,7 +434,6 @@ class WalletModel(context: Context) {
                 error = null
                 show()
                 refresh(force = true)
-                loadFees()
             } catch (e: Exception) {
                 error = e.message ?: e.javaClass.simpleName
                 note("wallet failed to open: " + why(e))
@@ -366,6 +456,7 @@ class WalletModel(context: Context) {
         payments = emptyList()
         outgoing = null
         synced = false
+        ready = false
         rates = null
         lastFees = 0L
         offline = null

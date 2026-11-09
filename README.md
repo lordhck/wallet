@@ -37,7 +37,7 @@ Requires Android 8.0 or newer.
 
 Your seed, PIN and keys never leave the phone. The app talks to these servers:
 
-- **Blockchain:** blockstream.info, with mempool.emzy.de and mempool.space as backups
+- **Blockchain:** blockstream.info, with mempool.space as backup
 - **Price:** Coinbase, with Kraken as backup, on Mainnet only
 
 You can set your own server in Settings.

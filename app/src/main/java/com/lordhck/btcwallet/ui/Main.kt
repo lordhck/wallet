@@ -3,6 +3,7 @@ package com.lordhck.btcwallet.ui
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.view.HapticFeedbackConstants
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -13,17 +14,21 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -36,7 +41,9 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.ClipOp
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
@@ -53,15 +60,21 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.google.zxing.BinaryBitmap
@@ -76,6 +89,7 @@ import com.lordhck.btcwallet.Money
 import com.lordhck.btcwallet.Net
 import com.lordhck.btcwallet.Payment
 import com.lordhck.btcwallet.Receiving
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.bitcoindevkit.AddressParseException
 import org.bitcoindevkit.CreateTxException
@@ -100,12 +114,12 @@ private fun Spinner() {
 }
 
 @Composable
-private fun PaymentRow(payment: Payment, amount: String, price: Double?, divider: Boolean, onClick: () -> Unit) {
+private fun PaymentRow(payment: Payment, amount: String, alt: String?, divider: Boolean, onClick: () -> Unit) {
     // stays highlighted until the payment is final
     val pending = payment.confirmations < FINAL_CONFIRMATIONS
     val sub = when {
         payment.sending -> "Sending…"
-        payment.confirmations == 0 -> if (payment.incoming) "Unconfirmed" else "Broadcast"
+        payment.confirmations == 0 -> if (payment.incoming) "Unconfirmed" else "0 of $FINAL_CONFIRMATIONS confirmations"
         pending -> "${payment.confirmations} of $FINAL_CONFIRMATIONS confirmations"
         else -> "Confirmed · " + SimpleDateFormat("d MMM", Locale.getDefault()).format(Date(payment.time!! * 1000))
     }
@@ -138,16 +152,17 @@ private fun PaymentRow(payment: Payment, amount: String, price: Double?, divider
             }
         }
         Column(horizontalAlignment = Alignment.End) {
-            Txt(
-                (if (payment.incoming) "+" else "−") + amount,
-                color = if (payment.incoming) C.green else C.text,
-                weight = 600,
-                tabular = true,
+            BasicText(
+                buildAnnotatedString {
+                    number((if (payment.incoming) "+" else "−") + amount, 15f, muted = mutedFor(payment))
+                },
+                style = style(if (payment.incoming) C.green else C.text, weight = 600, tabular = true),
+                maxLines = 1,
             )
             if (payment.self) {
                 Txt("Network fee", Modifier.padding(top = 2.dp), C.muted, 13f)
-            } else if (price != null) {
-                Txt(Money.usd(payment.sats, price), Modifier.padding(top = 2.dp), C.muted, 13f)
+            } else if (alt != null) {
+                Txt(alt, Modifier.padding(top = 2.dp), C.muted, 13f, tabular = true)
             }
         }
     }
@@ -155,7 +170,7 @@ private fun PaymentRow(payment: Payment, amount: String, price: Double?, divider
 
 private fun stage(payment: Payment): String = when {
     payment.sending -> "Sending…"
-    payment.confirmations == 0 -> if (payment.incoming) "Unconfirmed" else "Broadcast"
+    payment.confirmations == 0 -> if (payment.incoming) "Unconfirmed" else "0 of $FINAL_CONFIRMATIONS"
     payment.confirmations < FINAL_CONFIRMATIONS -> "${payment.confirmations} of $FINAL_CONFIRMATIONS"
     else -> "Confirmed"
 }
@@ -183,7 +198,7 @@ private fun Line(key: String, value: String, mono: Boolean = false) {
 // Card at the bottom of Home for one payment. Slides up from the bottom.
 // Tap outside, swipe down or Back slides it away.
 @Composable
-private fun BoxScope.TxCard(payment: Payment, amount: (Long) -> String, price: Double?, explorer: String, onClose: () -> Unit) {
+private fun BoxScope.TxCard(payment: Payment, amount: (Long) -> String, alt: (Long) -> String?, explorer: String, onClose: () -> Unit) {
     val nav = LocalNav.current
     val clipboard = LocalClipboardManager.current
     val uris = LocalUriHandler.current
@@ -254,15 +269,15 @@ private fun BoxScope.TxCard(payment: Payment, amount: (Long) -> String, price: D
                 Icon(if (payment.incoming) Ic.txIn else Ic.txOut, 20.dp, if (payment.incoming) C.green else C.soft)
             }
             Column(Modifier.weight(1f)) {
-                Txt(
-                    (if (payment.incoming) "+" else "−") + amount(payment.sats),
-                    color = if (payment.incoming) C.green else C.text,
-                    size = 24f,
-                    weight = 700,
-                    tabular = true,
+                val text = (if (payment.incoming) "+" else "−") + amount(payment.sats)
+                val size = if (text.length > 13) 20f else 24f
+                BasicText(
+                    buildAnnotatedString { number(text, size, muted = mutedFor(payment)) },
+                    style = style(if (payment.incoming) C.green else C.text, size, 700, tabular = true),
+                    maxLines = 1,
                 )
-                if (price != null) {
-                    Txt("≈ " + Money.usd(payment.sats, price), Modifier.padding(top = 2.dp), C.muted, 13.5f, tabular = true)
+                alt(payment.sats)?.let {
+                    Txt("≈ $it", Modifier.padding(top = 2.dp), C.muted, 13.5f, tabular = true)
                 }
             }
             Row(
@@ -325,20 +340,31 @@ private fun Action(label: String, bg: Color, icon: Int, onClick: () -> Unit) {
     )
 }
 
+// Green when synced and ready. Orange and pulsing while the first sync since
+// opening runs, steady orange while the server can't be reached.
 @Composable
-private fun BoxScope.TestBadge(label: String) {
+private fun NetChip(label: String, ready: Boolean, offline: Boolean, modifier: Modifier = Modifier) {
+    val color = if (ready && !offline) C.green else C.btc
+    val halo = if (!ready && !offline) {
+        rememberInfiniteTransition(label = "sync").animateFloat(
+            .1f,
+            .45f,
+            infiniteRepeatable(tween(700), RepeatMode.Reverse),
+            label = "halo",
+        ).value
+    } else {
+        .18f
+    }
     Row(
-        Modifier
-            .align(Alignment.TopStart)
-            .padding(start = 20.dp, top = 32.dp)
+        modifier
             .height(28.dp)
             .background(C.surface, CircleShape)
             .padding(start = 7.dp, end = 11.dp),
         Arrangement.spacedBy(4.dp),
         Alignment.CenterVertically,
     ) {
-        Box(Modifier.size(14.dp).background(C.btc.copy(alpha = .18f), CircleShape), Alignment.Center) {
-            Box(Modifier.size(8.dp).background(C.btc, CircleShape))
+        Box(Modifier.size(14.dp).background(color.copy(alpha = halo), CircleShape), Alignment.Center) {
+            Box(Modifier.size(8.dp).background(color, CircleShape))
         }
         Txt(label, color = C.soft, size = 13f, weight = 600)
     }
@@ -353,32 +379,37 @@ private fun HomeContent() {
     var details by remember { mutableStateOf<String?>(null) }
     // test coins have no dollar value
     val price = if (net == Net.Main) wallet.price else null
-    // starts over when a setting or the first price changes the list
-    var view by rememberSaveable(wallet.currency, wallet.unit, price != null) { mutableIntStateOf(0) }
-    // what Settings picked comes first, tapping moves through the rest
+    // what Settings picked comes first, tapping moves through the rest. The tap
+    // sets wallet.shown, so Activity, Send and review switch with it.
     val views = buildList {
-        val coin = Money.btc(wallet.sats) + " " + net.coin
-        val sats = Money.sats(wallet.sats)
+        val coin = "BTC" to Money.btc(wallet.sats) + " " + net.coin
+        val sats = "sats" to Money.sats(wallet.sats)
         // zero is zero in any currency, so this needs no price
-        val usd = price?.let { Money.usd(wallet.sats, it) } ?: if (net == Net.Main && wallet.sats == 0L) "$0.00" else null
+        val usd = (price?.let { Money.usd(wallet.sats, it) } ?: if (net == Net.Main && wallet.sats == 0L) "$0.00" else null)
+            ?.let { "USD" to it }
         if (usd != null && wallet.currency == "USD") add(usd)
         addAll(if (wallet.unit == "sats") listOf(sats, coin) else listOf(coin, sats))
         if (usd != null && wallet.currency != "USD") add(usd)
     }
-    val balance = if (nav.balanceHidden) "••••••" else views[view % views.size]
+    // USD isn't there without a price, like on test networks, so the first one shows then
+    val current = views.firstOrNull { it.first == wallet.shown } ?: views.first()
+    val balance = if (nav.balanceHidden) "••••••" else current.second
 
     Box(Modifier.fillMaxSize().background(C.bg).statusBarsPadding()) {
         Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
             // scales with the phone, a fixed offset leaves tall screens top heavy
             Spacer(Modifier.fillMaxHeight(.16f))
-            Txt(
-                balance,
+            val size = if (balance.length > 11) 32f else 46f
+            BasicText(
+                buildAnnotatedString { number(balance, size) },
                 Modifier.press {
-                    if (nav.balanceHidden) nav.balanceHidden = false else view = (view + 1) % views.size
+                    if (nav.balanceHidden) {
+                        nav.balanceHidden = false
+                    } else {
+                        wallet.display(views[(views.indexOf(current) + 1) % views.size].first)
+                    }
                 },
-                size = if (balance.length > 11) 32f else 46f,
-                weight = 700,
-                tabular = true,
+                style(size = size, weight = 700, tabular = true),
             )
             Txt(
                 when {
@@ -411,7 +442,7 @@ private fun HomeContent() {
                     Txt("No transactions yet", Modifier.padding(start = 4.dp, top = 4.dp), C.muted, 14f)
                 }
                 activity.forEachIndexed { i, payment ->
-                    PaymentRow(payment, wallet.amount(payment.sats), price, i > 0) {
+                    PaymentRow(payment, wallet.amount(payment.sats), wallet.alt(payment.sats), i > 0) {
                         // nothing to look up until the broadcast is done
                         if (!payment.sending) details = payment.id
                     }
@@ -426,10 +457,15 @@ private fun HomeContent() {
                 .press { nav.show(S.Settings) }
                 .padding(8.dp),
         ) { Icon(Ic.gear, 24.dp, C.soft) }
-        if (net != Net.Main) TestBadge(net.label)
+        NetChip(
+            net.label,
+            wallet.ready,
+            wallet.offline != null,
+            Modifier.align(Alignment.TopStart).padding(start = 20.dp, top = 32.dp),
+        )
         // looked up by id, so the card follows new confirmations and closes on a network switch
         wallet.activity.firstOrNull { it.id == details }?.let { payment ->
-            TxCard(payment, wallet::amount, price, net.explorer) { details = null }
+            TxCard(payment, wallet::amount, wallet::alt, net.explorer) { details = null }
         }
     }
 }
@@ -437,30 +473,141 @@ private fun HomeContent() {
 @Composable
 fun Home() = HomeContent()
 
+// The point and the decimals after it a little smaller and muted, as in
+// $1,234.56 or 0.00012345 BTC. The rest of the text is left as it is.
+private fun AnnotatedString.Builder.number(text: String, size: Float, points: String = ".", muted: Color = C.muted) {
+    val dot = text.indexOfFirst { it in points }
+    if (dot < 0) {
+        append(text)
+        return
+    }
+    var end = dot + 1
+    while (end < text.length && text[end].isDigit()) end++
+    append(text.substring(0, dot))
+    withStyle(SpanStyle(color = muted, fontSize = (size * .85f).sp)) { append(text.substring(dot, end)) }
+    append(text.substring(end))
+}
+
+// Green amounts keep their green, just fainter
+private fun mutedFor(payment: Payment) = if (payment.incoming) C.green.copy(alpha = .55f) else C.muted
+
+// What goes in Send's amount field for these sats in this unit. Plain digits,
+// no thousands separators, so it parses back the same.
+private fun typed(sats: Long, unit: String, price: Double?): String = when (unit) {
+    "sats" -> sats.toString()
+    "USD" -> price?.let { String.format(Locale.US, "%.2f", sats / 100_000_000.0 * it) } ?: ""
+    else -> java.math.BigDecimal(sats).movePointLeft(8).stripTrailingZeros().toPlainString()
+}
+
 // ---------- send ----------
-private val FEES = listOf("Slow" to "~1 hour", "Medium" to "~30 min", "Fast" to "~10 min")
+private val STOP_NAMES = listOf("Slow", "Medium", "Fast")
+
+// Where Slow, Medium and Fast sit on the fee slider. Fixed, so the labels never
+// overlap, even on test networks where Slow and Medium are both 1 sat/vB.
+private val STOP_AT = listOf(.25f, .5f, .75f)
+
+// One input and two outputs, the usual payment. Only for the estimate on the
+// Send screen, review shows the real fee of the built transaction.
+private const val TYPICAL_VBYTES = 141L
+
+// By slider position, not by rate: on test networks every stop is 1 sat/vB
+private fun eta(pos: Float): String = when {
+    pos >= STOP_AT[2] -> "~10 min"
+    pos >= STOP_AT[1] -> "~30 min"
+    pos >= STOP_AT[0] -> "~1 hour"
+    else -> "Hours"
+}
+
+// Slider position 0..1 to sat/vB: 1 at the left, 2x Fast at the right, linear between stops
+private fun rateAt(p: Float, stops: List<Long>): Long {
+    val xs = listOf(0f) + STOP_AT + 1f
+    val ys = listOf(1L) + stops + maxOf(stops[2] * 2, stops[2] + 1)
+    for (i in 0 until xs.lastIndex) {
+        if (p <= xs[i + 1]) {
+            val t = (p - xs[i]) / (xs[i + 1] - xs[i])
+            return (ys[i] + (ys[i + 1] - ys[i]) * t).roundToInt().toLong()
+        }
+    }
+    return ys.last()
+}
 
 @Composable
-private fun FeePicker(fee: Int, onPick: (Int) -> Unit) {
-    Column(Modifier.fillMaxWidth().padding(start = 6.dp, end = 6.dp, top = 5.dp, bottom = 4.dp)) {
-        BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 22.dp).height(22.dp)) {
-            val x by animateDpAsState(maxWidth * fee / 2, tween(200), label = "fee")
+// The knob's position is the state, and the rate comes from it. With the
+// rate as the state, equal stops (1, 1, 1 on Signet) put the knob at the far
+// left whatever was picked.
+private fun FeeSlider(pos: Float, stops: List<Long>, onPos: (Float) -> Unit) {
+    val view = LocalView.current
+    var dragging by remember { mutableStateOf(false) }
+    val knob by animateFloatAsState(if (dragging) 1.25f else 1f, tween(120), label = "knob")
+    val p = pos
+    // the gesture handlers below outlive a recomposition
+    val current by rememberUpdatedState(pos)
+    fun pick(x: Float, width: Int) {
+        if (width <= 0) return
+        var at = (x / width).coerceIn(0f, 1f)
+        // snaps onto a stop when close
+        STOP_AT.firstOrNull { kotlin.math.abs(it - at) < .03f }?.let { at = it }
+        if (at == current) return
+        // a tick for each whole sat/vB, and on reaching a stop
+        if (rateAt(at, stops) != rateAt(current, stops) || at in STOP_AT) {
+            view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+        }
+        onPos(at)
+    }
+    Column(Modifier.fillMaxWidth()) {
+        BoxWithConstraints(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 7.dp, vertical = 0.dp)
+                .padding(top = 6.dp)
+                .height(22.dp)
+                .pointerInput(stops) {
+                    detectTapGestures(onPress = { pick(it.x, size.width) })
+                }
+                .pointerInput(stops) {
+                    detectHorizontalDragGestures(
+                        onDragStart = { dragging = true; pick(it.x, size.width) },
+                        onDragEnd = { dragging = false },
+                        onDragCancel = { dragging = false },
+                    ) { change, _ ->
+                        change.consume()
+                        pick(change.position.x, size.width)
+                    }
+                },
+        ) {
+            val w = maxWidth
+            Box(Modifier.align(Alignment.CenterStart).fillMaxWidth().height(2.dp).background(C.surface3, CircleShape))
+            Box(Modifier.align(Alignment.CenterStart).width(w * p).height(2.dp).background(C.btc, CircleShape))
+            STOP_AT.forEachIndexed { i, at ->
+                Box(
+                    Modifier
+                        .align(Alignment.CenterStart)
+                        .offset(x = w * at - 2.dp)
+                        .size(4.dp)
+                        .background(if (pos >= at) C.btc else C.surface3, CircleShape),
+                )
+            }
             Box(
                 Modifier
-                    .align(Alignment.Center)
-                    .fillMaxWidth()
-                    .height(4.dp)
-                    .background(C.surface3, RoundedCornerShape(2.dp)),
+                    .align(Alignment.CenterStart)
+                    .offset(x = w * p - 7.dp)
+                    .size(14.dp)
+                    .graphicsLayer { scaleX = knob; scaleY = knob }
+                    .background(C.light, CircleShape),
             )
-            Box(Modifier.offset(x = x - 11.dp).size(22.dp).background(C.accent, CircleShape))
         }
-        Row(Modifier.fillMaxWidth().padding(top = 7.dp), Arrangement.SpaceBetween) {
-            FEES.forEachIndexed { i, f ->
+        BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 7.dp).height(18.dp)) {
+            val w = maxWidth
+            STOP_NAMES.forEachIndexed { i, name ->
                 Txt(
-                    f.first,
-                    Modifier.width(64.dp).press { onPick(i) },
-                    if (i == fee) C.text else C.dim,
-                    14f,
+                    name,
+                    Modifier
+                        .align(Alignment.CenterStart)
+                        .offset(x = w * STOP_AT[i] - 32.dp)
+                        .width(64.dp)
+                        .press { onPos(STOP_AT[i]) },
+                    if (pos == STOP_AT[i]) C.soft else C.muted,
+                    12f,
                     600,
                     align = TextAlign.Center,
                 )
@@ -469,21 +616,35 @@ private fun FeePicker(fee: Int, onPick: (Int) -> Unit) {
     }
 }
 
+// Groups of four, first and last in orange, as on Receive
+private fun grouped(address: String) = buildAnnotatedString {
+    val parts = address.chunked(4)
+    parts.forEachIndexed { i, part ->
+        if (i > 0) append(" ")
+        if (i == 0 || i == parts.lastIndex) {
+            withStyle(SpanStyle(color = C.btc)) { append(part) }
+        } else {
+            append(part)
+        }
+    }
+}
+
 @Composable
-private fun Kv(key: String, value: String, mono: Boolean = false) {
-    Spacer(Modifier.fillMaxWidth().height(1.dp).background(C.surface3))
+private fun Kv(key: String, value: String, divider: Boolean = true, bold: Boolean = false) {
+    if (divider) Spacer(Modifier.fillMaxWidth().height(1.dp).background(C.surface3))
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 13.dp),
+        Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 12.dp),
         Arrangement.spacedBy(16.dp),
     ) {
-        Txt(key, size = 14.5f)
+        Txt(key, size = 14.5f, weight = if (bold) 700 else 400)
         Txt(
             value,
             Modifier.weight(1f),
-            C.soft,
-            if (mono) 13.5f else 14.5f,
-            mono = mono,
+            if (bold) C.text else C.soft,
+            14.5f,
+            if (bold) 700 else 400,
             align = TextAlign.End,
+            tabular = true,
         )
     }
 }
@@ -495,28 +656,54 @@ private fun SlideToSend(onSlid: () -> Unit) {
     val near = with(density) { 6.dp.toPx() }
     val knob = with(density) { 52.dp.toPx() }
 
-    var label by remember { mutableStateOf("Slide to send") }
     var width by remember { mutableIntStateOf(0) }
     var x by remember { mutableFloatStateOf(0f) }
     var dragging by remember { mutableStateOf(false) }
     var sent by remember { mutableStateOf(false) }
-    val left by animateFloatAsState(
-        x,
-        if (dragging) snap() else tween(200),
-        label = "knob",
-    )
+    val left by animateFloatAsState(x, if (dragging) snap() else tween(250), label = "knob")
     val travel = maxOf(0f, width - knob - inset * 2)
+    // a light band sweeping across the text
+    val sweep by rememberInfiniteTransition(label = "sheen").animateFloat(
+        1.5f, -1f, infiniteRepeatable(tween(2400, easing = LinearEasing)), label = "sweep",
+    )
 
     Box(
         Modifier
             .fillMaxWidth()
-            .padding(top = 20.dp)
+            .padding(top = 16.dp)
             .height(60.dp)
-            .background(C.surface3, CircleShape)
+            .clip(CircleShape)
+            .background(C.bg)
             .onSizeChanged { width = it.width },
         contentAlignment = Alignment.Center,
     ) {
-        Txt(label, color = C.dim, weight = 600)
+        Box(
+            Modifier
+                .align(Alignment.CenterStart)
+                .fillMaxHeight()
+                .width(with(density) { (left + knob + inset).toDp() })
+                .background(
+                    Brush.horizontalGradient(listOf(C.btc.copy(alpha = .05f), C.btc.copy(alpha = .35f))),
+                    CircleShape,
+                ),
+        )
+        val look = if (sent) {
+            style(C.soft, weight = 600, align = TextAlign.Center)
+        } else {
+            val w = width.toFloat().coerceAtLeast(1f)
+            val band = w * 2.5f
+            val start = sweep * w
+            style(weight = 600, align = TextAlign.Center).merge(
+                TextStyle(
+                    brush = Brush.linearGradient(
+                        0f to C.dim, .4f to C.dim, .5f to C.light, .6f to C.dim, 1f to C.dim,
+                        start = Offset(start, 0f),
+                        end = Offset(start + band, 0f),
+                    ),
+                ),
+            )
+        }
+        BasicText(if (sent) "Sending…" else "Slide to send", Modifier.fillMaxWidth(), look)
         Box(
             Modifier
                 .align(Alignment.CenterStart)
@@ -530,7 +717,7 @@ private fun SlideToSend(onSlid: () -> Unit) {
                             dragging = false
                             if (x >= travel - near && !sent) {
                                 sent = true
-                                label = "Sending…"
+                                x = travel
                                 onSlid()
                             } else if (!sent) {
                                 x = 0f
@@ -546,7 +733,22 @@ private fun SlideToSend(onSlid: () -> Unit) {
                     }
                 },
             contentAlignment = Alignment.Center,
-        ) { Icon(Ic.arrow, color = Color.Black) }
+        ) {
+            if (sent) {
+                val turn by rememberInfiniteTransition(label = "spin").animateFloat(
+                    0f, 360f, infiniteRepeatable(tween(800, easing = LinearEasing)), label = "turn",
+                )
+                Canvas(Modifier.size(20.dp).graphicsLayer { rotationZ = turn }) {
+                    val stroke = 2.4.dp.toPx()
+                    val at = Offset(stroke / 2, stroke / 2)
+                    val box = Size(size.width - stroke, size.height - stroke)
+                    drawArc(Color.Black.copy(alpha = .25f), 0f, 360f, false, at, box, style = Stroke(stroke))
+                    drawArc(Color.Black, -90f, 90f, false, at, box, style = Stroke(stroke, cap = StrokeCap.Round))
+                }
+            } else {
+                Icon(Ic.arrow, color = Color.Black)
+            }
+        }
     }
 }
 
@@ -554,42 +756,135 @@ private fun SlideToSend(onSlid: () -> Unit) {
 private fun BoxScope.ConfirmSheet(
     draft: Draft,
     amount: (Long) -> String,
-    price: Double?,
+    alt: (Long) -> String?,
+    eta: String,
     sending: Boolean,
     onClose: () -> Unit,
     onSlid: () -> Unit,
 ) {
-    Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .6f)).press { if (!sending) onClose() })
+    // 1 is fully below the screen, 0 is in place
+    val out = remember { Animatable(1f) }
+    var height by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) { out.animateTo(0f, tween(280, easing = FastOutSlowInEasing)) }
+    Box(
+        Modifier
+            .fillMaxSize()
+            .graphicsLayer { alpha = 1f - out.value }
+            .background(Color.Black.copy(alpha = .6f))
+            .press { if (!sending) onClose() },
+    )
     Column(
         Modifier
             .align(Alignment.BottomCenter)
             .fillMaxWidth()
-            .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+            .onSizeChanged { height = it.height }
+            .graphicsLayer { translationY = out.value * height }
+            .clip(RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp))
             .background(C.surface)
             .press { }
             .navigationBarsPadding()
-            .padding(start = 16.dp, end = 16.dp, top = 24.dp, bottom = 28.dp),
+            .padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 24.dp),
     ) {
-        Txt(
-            amount(draft.sats),
+        Box(
+            Modifier
+                .align(Alignment.CenterHorizontally)
+                .padding(bottom = 18.dp)
+                .size(36.dp, 4.dp)
+                .background(C.surface3, RoundedCornerShape(2.dp)),
+        )
+        val text = amount(draft.sats)
+        BasicText(
+            buildAnnotatedString {
+                // "50,000 sats" has a unit to dim, "$34.00" doesn't
+                if (' ' in text) {
+                    number(text.substringBeforeLast(' '), 34f)
+                    withStyle(SpanStyle(color = C.dim, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)) {
+                        append(" " + text.substringAfterLast(' '))
+                    }
+                } else {
+                    number(text, 34f)
+                }
+            },
             Modifier.fillMaxWidth(),
-            size = 30f,
-            weight = 700,
-            align = TextAlign.Center,
-            tabular = true,
+            style(size = 34f, weight = 700, align = TextAlign.Center, tabular = true),
         )
-        Txt(
-            if (price != null) "≈ " + Money.usd(draft.sats, price) else "",
-            Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 20.dp),
-            C.dim,
-            14.5f,
-            align = TextAlign.Center,
-        )
-        Kv("To", draft.to, mono = true)
-        Kv("Network fee", Money.sats(draft.fee))
-        Kv("Total", amount(draft.sats + draft.fee))
+        alt(draft.sats)?.let {
+            Txt(
+                "≈ $it",
+                Modifier.fillMaxWidth().padding(top = 4.dp),
+                C.dim,
+                align = TextAlign.Center,
+                tabular = true,
+            )
+        }
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(top = 20.dp, bottom = 6.dp)
+                .background(C.bg, RoundedCornerShape(14.dp))
+                .padding(12.dp),
+            Arrangement.spacedBy(10.dp),
+            Alignment.CenterVertically,
+        ) {
+            Box(Modifier.size(34.dp).background(C.surface2, CircleShape), Alignment.Center) {
+                Icon(Ic.send, 18.dp, C.soft)
+            }
+            BasicText(
+                grouped(draft.to),
+                Modifier.weight(1f),
+                style(C.dim, 12.5f, 600, mono = true, line = 1.5f, spacing = .02f),
+            )
+        }
+        Kv("Network fee", amount(draft.fee) + " · " + eta, divider = false)
+        Kv("Total", amount(draft.sats + draft.fee), bold = true)
         SlideToSend(onSlid)
         if (!sending) Ghost("Cancel", onClose)
+    }
+}
+
+// Shows "0" in grey when empty, the decimals muted, and the unit after the
+// number, smaller and dim
+private fun withUnit(unit: String, size: Float) = VisualTransformation { text ->
+    val shown = buildAnnotatedString {
+        if (text.isEmpty()) {
+            withStyle(SpanStyle(color = C.placeholder)) { append("0") }
+        } else {
+            // typed amounts have no thousands separators, so a comma is the point
+            number(text.text, size, ".,")
+        }
+        withStyle(SpanStyle(color = C.dim, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)) { append(" $unit") }
+    }
+    val length = text.length
+    TransformedText(
+        shown,
+        object : OffsetMapping {
+            override fun originalToTransformed(offset: Int) = offset
+            override fun transformedToOriginal(offset: Int) = minOf(offset, length)
+        },
+    )
+}
+
+@Composable
+private fun UnitSwitch(units: List<String>, unit: Int, onPick: (Int) -> Unit) {
+    Row(
+        Modifier
+            .padding(top = 12.dp)
+            .background(C.surface, CircleShape)
+            .padding(3.dp),
+    ) {
+        units.forEachIndexed { i, label ->
+            Txt(
+                label,
+                Modifier
+                    .clip(CircleShape)
+                    .background(if (i == unit) C.surface3 else Color.Transparent)
+                    .press { onPick(i) }
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
+                if (i == unit) C.text else C.dim,
+                13f,
+                600,
+            )
+        }
     }
 }
 
@@ -606,8 +901,16 @@ fun Send() {
 
     var addr by rememberSaveable { mutableStateOf("") }
     var amount by rememberSaveable { mutableStateOf("") }
-    var unit by rememberSaveable { mutableIntStateOf(if (wallet.unit == "sats") units.lastIndex else coinUnit) }
-    var fee by rememberSaveable { mutableIntStateOf(1) }
+    // the unit is the one amounts show in everywhere. Tapping the balance on Home
+    // changes it, and so does the switch here.
+    val unit = when {
+        wallet.shown == "sats" -> units.lastIndex
+        wallet.shown == "USD" && net == Net.Main && price != null -> 0
+        else -> coinUnit
+    }
+    fun keyOf(i: Int) = if (units[i] == "USD" || units[i] == "sats") units[i] else "BTC"
+    // where the fee slider's knob is, 0 to 1. Starts at Medium.
+    var pos by rememberSaveable { mutableFloatStateOf(STOP_AT[1]) }
     var all by rememberSaveable { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
@@ -618,97 +921,117 @@ fun Send() {
         nav.scanned?.let { code ->
             nav.scanned = null
             addr = code.removePrefix("bitcoin:").removePrefix("BITCOIN:").substringBefore('?')
+            // a payment link's amount is in BTC, shown here in the current unit
             Regex("[?&]amount=([0-9.]+)", RegexOption.IGNORE_CASE).find(code)?.let {
-                amount = it.groupValues[1]
-                unit = coinUnit
-                all = false
+                Money.parse(it.groupValues[1], "BTC", price)?.let { linked ->
+                    amount = typed(linked, units[unit], price)
+                    all = false
+                }
             }
         }
-        wallet.loadFees(force = true)
+        wallet.loadFees()
     }
+    val stops = wallet.rates
+    // sat/vB, 0 until the first rates arrive
+    val rate = stops?.let { rateAt(pos, it) } ?: 0L
 
-    val sats = Money.parse(amount, units[unit % units.size], price)
-    val rate = wallet.rates?.get(fee)
-    val ready = addr.isNotBlank() && (all || sats != null) && rate != null && !busy
+    val unitName = units[unit]
+    val sats = Money.parse(amount, unitName, price)
+    val ready = addr.isNotBlank() && (all || sats != null) && stops != null && rate > 0 && !busy
 
     BackHandler(draft != null && !sending) { draft = null }
     Box(Modifier.fillMaxSize()) {
         Scr {
             Bar("Send")
             Body {
-                InputRow {
-                    Input(addr, { addr = it }, "Bitcoin address", Modifier.weight(1f), mono = true, bare = true)
-                    IconBtn(Ic.paste) { clipboard.getText()?.let { addr = it.text.trim() } }
-                    IconBtn(Ic.scan, C.accent) { nav.show(S.Scanner) }
-                }
-                Gt("Amount")
-                InputRow {
-                    Input(
+                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                    NetChip(net.label, wallet.ready, wallet.offline != null)
+                    // the amount, typed in place, full width and centered. The unit is
+                    // added by the field's transformation, so number and unit center
+                    // together and the cursor can't move into the unit.
+                    val size = when {
+                        amount.length > 11 -> 30f
+                        amount.length > 8 -> 36f
+                        else -> 44f
+                    }
+                    BasicTextField(
                         amount,
                         {
                             amount = it
                             all = false
                         },
-                        "0",
-                        Modifier.weight(1f),
-                        big = true,
-                        bare = true,
-                        keyboard = KeyboardType.Decimal,
+                        Modifier.fillMaxWidth().padding(top = 26.dp),
+                        textStyle = style(size = size, weight = 700, align = TextAlign.Center, tabular = true, spacing = -.01f),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        visualTransformation = withUnit(unitName, size),
+                        cursorBrush = SolidColor(C.text),
                     )
-                    Row(
-                        Modifier
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(C.surface3)
-                            .press {
-                                unit = (unit + 1) % units.size
-                                all = false
-                            }
-                            .padding(horizontal = 11.dp, vertical = 7.dp),
-                        Arrangement.spacedBy(5.dp),
-                        Alignment.CenterVertically,
-                    ) {
-                        Txt(units[unit % units.size], size = 13.5f, weight = 600)
-                        Icon(Ic.updown, 14.dp, C.dim)
+                    val alt = when {
+                        sats == null -> ""
+                        unitName == "USD" -> "≈ " + Money.sats(sats)
+                        price != null -> "≈ " + Money.usd(sats, price)
+                        unitName == "sats" -> "≈ " + Money.btc(sats) + " " + net.coin
+                        else -> "≈ " + Money.sats(sats)
                     }
-                }
-                Row(
-                    Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 8.dp),
-                    Arrangement.SpaceBetween,
-                ) {
-                    Txt(
-                        if (sats != null && price != null) "≈ " + Money.usd(sats, price) else "",
-                        color = C.muted,
-                        size = 13f,
-                    )
                     BasicText(
                         buildAnnotatedString {
-                            append("Available " + wallet.amount(wallet.sats) + " · ")
-                            withStyle(SpanStyle(color = C.accent, fontWeight = FontWeight.SemiBold)) {
-                                append("Max")
-                            }
+                            if (alt.isNotEmpty()) append("$alt · ")
+                            withStyle(SpanStyle(color = C.btc, fontWeight = FontWeight.SemiBold)) { append("Max") }
                         },
-                        Modifier.press {
-                            amount = Money.btc(wallet.sats)
-                            unit = coinUnit
+                        Modifier.padding(top = 6.dp).press {
+                            amount = typed(wallet.sats, unitName, price)
                             all = true
                         },
-                        style(C.muted, 13f),
+                        style(C.muted, 13.5f, tabular = true),
                     )
+                    UnitSwitch(units, unit) { next ->
+                        // the amount is converted, so it stays the same value. Max stays Max.
+                        val value = if (all) wallet.sats else sats
+                        if (value != null) amount = typed(value, units[next], price)
+                        wallet.display(keyOf(next))
+                    }
                 }
-                Gt("Network fee")
-                FeePicker(fee) { fee = it }
-                Msg(
-                    error ?: rate?.let { if (net == Net.Main) FEES[fee].second + " · $it sat/vB" else "$it sat/vB" }
-                        ?: "Getting fees…",
-                    error != null,
-                )
+                Spacer(Modifier.height(26.dp))
+                InputRow {
+                    Input(addr, { addr = it }, "Bitcoin address", Modifier.weight(1f), mono = true, bare = true)
+                    IconBtn(Ic.paste) { clipboard.getText()?.let { addr = it.text.trim() } }
+                    IconBtn(Ic.scan, C.accent) { nav.show(S.Scanner) }
+                }
+                // network fee: a one line summary over a thin slider
+                Column(Modifier.fillMaxWidth().padding(top = 26.dp, start = 4.dp, end = 4.dp)) {
+                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.Bottom) {
+                        Txt("NETWORK FEE", color = C.muted, size = 12f, weight = 600, spacing = .09f)
+                        if (stops != null && rate > 0) {
+                            val time = eta(pos)
+                            val fee = rate * TYPICAL_VBYTES
+                            BasicText(
+                                buildAnnotatedString {
+                                    withStyle(
+                                        SpanStyle(
+                                            color = if (pos < STOP_AT[0]) C.btc else C.text,
+                                            fontWeight = FontWeight.SemiBold,
+                                        ),
+                                    ) { append(time) }
+                                    append(" · ~" + Money.sats(fee))
+                                    if (price != null) append(" · " + Money.usd(fee, price))
+                                },
+                                style = style(C.soft, 13.5f, tabular = true),
+                                maxLines = 1,
+                            )
+                        } else {
+                            Txt("Getting fees…", color = C.soft, size = 13.5f)
+                        }
+                    }
+                    if (stops != null) FeeSlider(pos, stops) { pos = it }
+                }
+                Spacer(Modifier.height(32.dp))
                 Primary(if (busy) "Checking…" else "Review", ready) {
                     busy = true
                     error = null
                     scope.launch {
                         try {
-                            val feeRate = checkNotNull(rate)
-                            draft = wallet.use { it.draft(addr.trim(), if (all) null else sats, feeRate) }
+                            draft = wallet.use { it.draft(addr.trim(), if (all) null else sats, rate) }
                         } catch (e: AddressParseException) {
                             Debug.note("review failed: " + Debug.why(e))
                             error = "That isn't a valid ${net.label} address"
@@ -728,13 +1051,15 @@ fun Send() {
                         busy = false
                     }
                 }
+                error?.let { Msg(it, true) }
             }
         }
         draft?.let { ready ->
             ConfirmSheet(
                 ready,
                 wallet::amount,
-                price,
+                wallet::alt,
+                eta(pos),
                 sending,
                 onClose = { draft = null },
                 onSlid = {
@@ -776,6 +1101,7 @@ fun Receive() {
     var failed by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(wallet.net) {
+        wallet.watch()
         try {
             receiving = wallet.use { it.address() }
         } catch (e: Exception) {
@@ -784,76 +1110,115 @@ fun Receive() {
         }
     }
 
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(1400)
+            copied = false
+        }
+    }
+    val copy: () -> Unit = {
+        receiving?.let {
+            clipboard.setText(AnnotatedString(it.address))
+            nav.toast("Address copied")
+            copied = true
+        }
+    }
+    val copyBg by animateColorAsState(if (copied) C.green else C.btc, tween(200), label = "copy")
+
     val current = receiving
     Scr {
         Bar("Receive")
         Body(scroll = false) {
-            Spacer(Modifier.weight(1f))
-            if (current == null) {
-                Txt(
-                    failed?.let { "Couldn't get an address: $it" } ?: "Getting an address…",
-                    Modifier.fillMaxWidth(),
-                    if (failed != null) C.red else C.muted,
-                    15f,
-                    align = TextAlign.Center,
-                )
-            } else {
-                Column(
-                    Modifier.fillMaxWidth(),
-                    Arrangement.spacedBy(22.dp),
-                    Alignment.CenterHorizontally,
-                ) {
-                    Box(Modifier.background(Color.White, RoundedCornerShape(22.dp)).padding(16.dp)) {
-                        Qr(current.uri, 248.dp)
-                    }
-                    val parts = current.address.chunked(4)
-                    BasicText(
-                        buildAnnotatedString {
-                            parts.forEachIndexed { i, p ->
-                                if (i > 0) append(' ')
-                                if (i == 0 || i == parts.lastIndex) {
-                                    withStyle(SpanStyle(color = C.text, fontWeight = FontWeight.SemiBold)) { append(p) }
-                                } else {
-                                    append(p)
-                                }
-                            }
-                        },
-                        Modifier.widthIn(max = 300.dp),
-                        style(C.soft, 15f, mono = true, align = TextAlign.Center, line = 1.6f, spacing = .02f),
+            Column(
+                Modifier.fillMaxWidth().weight(1f).padding(horizontal = 4.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                // every address here is BIP84
+                NetChip("${wallet.net.label} · Native SegWit", wallet.ready, wallet.offline != null)
+                // free space splits 1 above and 0.6 below, so the group sits a little above center
+                Spacer(Modifier.weight(1f))
+                if (current == null) {
+                    Txt(
+                        failed?.let { "Couldn't get an address: $it" } ?: "Getting an address…",
+                        Modifier.fillMaxWidth(),
+                        if (failed != null) C.red else C.muted,
+                        15f,
+                        align = TextAlign.Center,
                     )
-                }
-            }
-            Spacer(Modifier.weight(1f))
-            Row(Modifier.fillMaxWidth(), Arrangement.spacedBy(12.dp)) {
-                Btn("Copy", Modifier.weight(1f), C.light, Color.Black, Ic.copy, 0.dp, enabled = current != null) {
-                    current?.let {
-                        clipboard.setText(AnnotatedString(it.address))
-                        nav.toast("Address copied")
+                } else {
+                    Box(Modifier.background(Color.White, RoundedCornerShape(24.dp)).padding(16.dp)) {
+                        Qr(current.uri, 232.dp)
                     }
-                }
-                Btn("Share", Modifier.weight(1f), C.surface, C.text, Ic.share, 0.dp, enabled = current != null) {
-                    current?.let {
-                        val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, it.address)
-                        context.startActivity(Intent.createChooser(send, null))
-                    }
-                }
-            }
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(top = 18.dp)
-                    .press {
-                        scope.launch {
-                            receiving = runCatching { wallet.use { it.newAddress() } }.getOrNull() ?: receiving
-                            nav.toast("New address")
+                    BasicText(
+                        grouped(current.address),
+                        Modifier
+                            .padding(top = 18.dp)
+                            .widthIn(max = 280.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .press(C.surface, onClick = copy)
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        style(C.dim, 15f, 600, mono = true, align = TextAlign.Center, line = 1.55f, spacing = .02f),
+                    )
+                    // Copy and Share as one pill
+                    Row(
+                        Modifier
+                            .padding(top = 22.dp)
+                            .fillMaxWidth()
+                            .height(56.dp)
+                            .background(C.surface, CircleShape)
+                            .padding(4.dp),
+                        Arrangement.spacedBy(4.dp),
+                    ) {
+                        Row(
+                            Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .clip(CircleShape)
+                                .background(copyBg)
+                                .press(onClick = copy),
+                            Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                            Alignment.CenterVertically,
+                        ) {
+                            Icon(if (copied) Ic.check else Ic.copy, 18.dp, Color.Black)
+                            Txt(if (copied) "Copied" else "Copy", color = Color.Black, weight = 600)
+                        }
+                        Row(
+                            Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .clip(CircleShape)
+                                .press(C.surface3) {
+                                    val send = Intent(Intent.ACTION_SEND).setType("text/plain")
+                                        .putExtra(Intent.EXTRA_TEXT, current.address)
+                                    context.startActivity(Intent.createChooser(send, null))
+                                },
+                            Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                            Alignment.CenterVertically,
+                        ) {
+                            Icon(Ic.share, 18.dp, C.text)
+                            Txt("Share", weight = 600)
                         }
                     }
-                    .padding(6.dp),
-                Arrangement.spacedBy(7.dp, Alignment.CenterHorizontally),
-                Alignment.CenterVertically,
-            ) {
-                Icon(Ic.refresh, 15.dp, C.dim)
-                Txt("New address", color = C.dim, size = 14f, weight = 600)
+                    Row(
+                        Modifier
+                            .padding(top = 14.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .press {
+                                scope.launch {
+                                    receiving = runCatching { wallet.use { it.newAddress() } }.getOrNull() ?: receiving
+                                    nav.toast("New address")
+                                }
+                            }
+                            .padding(6.dp),
+                        Arrangement.spacedBy(7.dp),
+                        Alignment.CenterVertically,
+                    ) {
+                        Icon(Ic.refresh, 15.dp, C.dim)
+                        Txt("New address", color = C.dim, size = 14f, weight = 600)
+                    }
+                }
+                Spacer(Modifier.weight(.6f))
             }
         }
     }
